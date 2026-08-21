@@ -1,0 +1,68 @@
+go2_mapping:
+  ros__parameters:
+    # These are host-clock-normalized copies from sensor_time_bridge. Do not
+    # point host-clock ROS consumers at the raw /utlidar streams on this robot.
+    cloud_topic: /go2/lidar/cloud_deskewed
+    odom_topic: /go2/odom
+    map_cloud_topic: /go2/map/cloud
+    occupancy_topic: /map
+    status_topic: /go2/mapping/status
+    time_sync_status_topic: /go2/time_sync/status
+    require_time_sync_status: true
+    world_frame: odom
+
+    voxel_size: 0.10
+    # The registered L1 cloud contains zero-padded slots close to the robot.
+    min_point_range: 0.15
+    max_point_range: 15.0
+    # sensor_time_bridge converts the mounted L1 convention to REP-103 Z-up.
+    min_relative_z: -1.0
+    max_relative_z: 3.0
+    max_voxels: 300000
+    # Zero retains the global map until max_voxels eviction; set a radius for a
+    # rolling local 3D map.
+    retention_radius: 0.0
+
+    grid_resolution: 0.10
+    # Include body-height obstacles while excluding the floor below the sensor.
+    obstacle_min_height: -0.22
+    obstacle_max_height: 0.50
+    hit_log_odds: 0.85
+    miss_log_odds: -0.40
+    min_log_odds: -2.0
+    max_log_odds: 3.5
+    max_grid_cells: 500000
+    max_rays_per_cloud: 4000
+    max_ray_cells: 4096
+    max_dense_grid_cells: 4000000
+
+    max_cloud_points: 300000
+    max_cloud_age_sec: 2.0
+    max_odom_age_sec: 0.5
+    out_of_order_tolerance_sec: 0.05
+    future_tolerance_sec: 1.0
+
+    cloud_publish_rate: 0.5
+    occupancy_publish_rate: 1.0
+    status_publish_rate: 1.0
+
+    output_dir: ~/go2_maps
+    load_state_path: ""
+    # OccupancyGrid probabilities classified into white/black PGM pixels.
+    # Intermediate and unknown cells use standard gray 205. map.yaml is always
+    # written with map_server's strict 0.196/0.65 trinary thresholds so gray
+    # reloads as unknown, never free.
+    save_free_threshold: 25
+    save_occupied_threshold: 65
+
+go2_odom_tf_bridge:
+  ros__parameters:
+    odom_topic: /go2/odom
+    odom_frame: odom
+    base_frame: base_link
+    # Never silently relabel a transform from an unexpected child frame.
+    require_child_frame_match: true
+    time_sync_status_topic: /go2/time_sync/status
+    require_time_sync_status: true
+    max_message_age_sec: 2.0
+    future_tolerance_sec: 1.0

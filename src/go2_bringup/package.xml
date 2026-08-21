@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>go2_bringup</name>
+  <version>0.1.0</version>
+  <description>Composed bringup for Go2 EDU mapping, navigation, and semantic mapping.</description>
+  <maintainer email="robotics@example.com">Go2 SLAM Navigation Maintainers</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>go2_mapping</exec_depend>
+  <exec_depend>go2_navigation</exec_depend>
+  <exec_depend>go2_robot_bridge</exec_depend>
+  <exec_depend>go2_semantic_mapping</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

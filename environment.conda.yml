@@ -1,0 +1,10 @@
+name: slam_nav
+channels:
+  - conda-forge
+dependencies:
+  - python=3.8
+  - pip
+
+# Jetson's CUDA-enabled Torch and the proven Ultralytics stack are mirrored
+# from the device's existing detector venv by scripts/create_conda_env.sh.
+# Installing generic conda/pip Torch packages would replace the Jetson build.

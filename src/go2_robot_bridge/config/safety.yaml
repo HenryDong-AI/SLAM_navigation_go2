@@ -1,0 +1,62 @@
+motion_bridge:
+  ros__parameters:
+    cmd_vel_topic: /cmd_vel
+    odom_topic: /go2/odom
+    front_cloud_topic: /go2/lidar/cloud_base
+    time_sync_status_topic: /go2/time_sync/status
+    require_time_sync: true
+    time_sync_status_timeout_sec: 1.0
+
+    # Conservative defaults for indoor commissioning.
+    control_rate_hz: 20.0
+    max_linear_x: 0.40
+    max_linear_y: 0.25
+    max_angular_z: 0.60
+    linear_slew_rate: 0.60
+    angular_slew_rate: 1.20
+    command_timeout_sec: 0.50
+
+    require_fresh_odom: true
+    odom_timeout_sec: 0.50
+    expected_odom_frame: odom
+    expected_base_frame: base_link
+    expected_cloud_frame: base_link
+    sensor_future_tolerance_sec: 0.10
+
+    # StopMove is refreshed while no motion is allowed. This is frequent
+    # enough to be robust without flooding the DDS RPC service.
+    stop_repeat_sec: 0.20
+    shutdown_stop_repetitions: 3
+    shutdown_stop_interval_sec: 0.05
+
+    front_obstacle_guard_enabled: true
+    front_cloud_timeout_sec: 0.50
+    fail_closed_on_cloud_timeout: true
+    require_fresh_cloud_to_arm: true
+    front_min_x: 0.15
+    front_max_x: 0.80
+    front_half_width: 0.35
+
+    # sensor_time_bridge publishes REP-103 (+X forward, +Y left, +Z up).
+    # The floor is below the sensor and excluded from this obstacle band.
+    front_min_z: -0.22
+    front_max_z: 0.50
+    front_min_points: 5
+    front_cloud_sample_stride: 1
+    # Empty/all-zero/NaN/dropout clouds never refresh the safety watchdog.
+    front_cloud_health_min_points: 20
+    front_cloud_health_min_range: 0.10
+    front_cloud_health_max_range: 30.0
+
+    sdk_timeout_sec: 1.0
+    sdk_reconnect_delay_sec: 2.0
+    # SportClient lives in a non-ROS child because its Python CycloneDDS
+    # binding cannot safely share a process with rclpy on this device.
+    worker_startup_timeout_sec: 5.0
+    worker_rpc_timeout_sec: 1.5
+    worker_reap_timeout_sec: 2.0
+    # SportClient startup blocks the single-threaded ROS executor. Keep
+    # StopMove asserted until new time/odom/LiDAR callbacks run afterward.
+    post_worker_sensor_refresh_timeout_sec: 2.0
+    require_noshm_runtime: true
+    noshm_library_fragment: install_noshm/lib

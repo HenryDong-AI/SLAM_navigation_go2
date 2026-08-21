@@ -1,0 +1,10 @@
+routes:
+  commissioning_square:
+    frame_id: odom
+    loop: false
+    waypoints:
+      - {name: start, x: 0.0, y: 0.0, yaw: 0.0, wait: 1.0, timeout: 90.0}
+      - {name: front, x: 1.0, y: 0.0, yaw: 1.5708, wait: 1.0, timeout: 90.0}
+      - {name: left, x: 1.0, y: 1.0, yaw: 3.1416, wait: 1.0, timeout: 90.0}
+      - {name: return_side, x: 0.0, y: 1.0, yaw: -1.5708, wait: 1.0, timeout: 90.0}
+      - {name: home, x: 0.0, y: 0.0, yaw: 0.0, wait: 0.0, timeout: 90.0}

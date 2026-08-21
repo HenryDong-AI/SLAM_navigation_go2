@@ -1,0 +1,30 @@
+# UNCALIBRATED PLACEHOLDER.
+# Run a real calibration for the exact Go2 front camera before using image-to-
+# LiDAR projection. Zero focal lengths intentionally mark this CameraInfo as
+# uncalibrated; the bridge will warn at startup.
+image_width: 1920
+image_height: 1080
+camera_name: go2_front_camera
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [0.0, 0.0, 0.0, 0.0, 0.0]
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [0.0, 0.0, 0.0,
+         0.0, 0.0, 0.0,
+         0.0, 0.0, 1.0]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1.0, 0.0, 0.0,
+         0.0, 1.0, 0.0,
+         0.0, 0.0, 1.0]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [0.0, 0.0, 0.0, 0.0,
+         0.0, 0.0, 0.0, 0.0,
+         0.0, 0.0, 1.0, 0.0]

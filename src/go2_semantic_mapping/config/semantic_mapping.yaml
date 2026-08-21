@@ -1,0 +1,92 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Go2 Semantic Mapping contributors
+
+semantic_mapping:
+  ros__parameters:
+    # Inputs. The built-in camera bridge must publish sensor_msgs/Image.
+    image_topic: /go2/camera/image_rect
+    # Host-clock-normalized copies from sensor_time_bridge.
+    cloud_topic: /go2/lidar/cloud_base
+    odom_topic: /go2/odom
+    camera_info_topic: /go2/camera/camera_info
+
+    # Outputs and frames. Input cloud points must already be in base_link.
+    semantic_cloud_topic: /go2/semantic/cloud
+    semantic_marker_topic: /go2/semantic/markers
+    annotated_image_topic: /go2/semantic/annotated_image
+    save_service: /go2/semantic/save
+    reset_service: /go2/semantic/reset
+    map_frame: odom
+    base_frame: base_link
+    expected_cloud_frame: base_link
+    reject_unexpected_cloud_frame: true
+    reject_unexpected_odom_frames: true
+    time_sync_status_topic: /go2/time_sync/status
+    require_time_sync_status: true
+    time_sync_status_timeout_sec: 1.0
+
+    # CALIBRATION IS REQUIRED. Semantics remain disabled with these placeholders.
+    # The matrix is row-major T_camera_optical_from_REP103_base:
+    #   p_camera_optical = base_to_camera_optical * p_base
+    # Optical axes are x-right, y-down, z-forward.
+    calibration_confirmed: false
+    require_calibration_confirmation: true
+    fx: 0.0
+    fy: 0.0
+    cx: 0.0
+    cy: 0.0
+    expected_image_width: 1920
+    expected_image_height: 1080
+    expected_camera_frame: go2_front_camera_optical_frame
+    require_matching_camera_info: true
+    camera_info_intrinsics_tolerance: 0.001
+    base_to_camera_optical:
+      [1.0, 0.0, 0.0, 0.0,
+       0.0, 1.0, 0.0, 0.0,
+       0.0, 0.0, 1.0, 0.0,
+       0.0, 0.0, 0.0, 1.0]
+
+    # Ultralytics is optional and imported only on first enabled inference.
+    # Keep detector_model empty for a clean geometry-only fallback with no download.
+    detector_enabled: true
+    detector_model: /home/unitree/Documents/demov1/yolov8n.pt
+    detector_device: ""
+    detector_classes_csv: ""
+    detector_confidence: 0.35
+    detector_iou: 0.45
+    inference_rate_hz: 2.0
+    max_processing_latency_sec: 5.0
+
+    # Message association guards. sensor_time_bridge maps native LiDAR/odom
+    # stamps into the Jetson ROS clock while preserving their relative timing.
+    max_image_cloud_delta_sec: 0.15
+    # Add a measured offset here if the image header lags true exposure time;
+    # a negative value associates the image with an earlier LiDAR sample.
+    camera_time_offset_sec: 0.0
+    cloud_buffer_size: 30
+    max_cached_cloud_age_sec: 0.50
+    max_odom_delta_sec: 0.10
+    odom_buffer_size: 250
+
+    # Projection and foreground-surface gating.
+    max_cloud_points_per_fusion: 50000
+    projection_min_depth: 0.15
+    projection_max_depth: 15.0
+    minimum_detection_points: 3
+    absolute_depth_gate: 0.25
+    depth_mad_scale: 3.0
+    # Sparse depth-colored LiDAR overlay for calibration QA, detector-independent.
+    draw_projected_points: true
+    max_projected_points_overlay: 1200
+    projected_point_radius: 1
+
+    # Bounded persistent voxel map.
+    voxel_size: 0.10
+    max_voxels: 100000
+    default_rgb: [128, 128, 128]
+    publish_rate_hz: 1.0
+    max_label_markers: 250
+    marker_text_height: 0.12
+    marker_z_offset: 0.12
+    save_directory: ~/go2_semantic_maps
+    save_prefix: semantic_map
