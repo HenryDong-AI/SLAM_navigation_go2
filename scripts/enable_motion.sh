@@ -4,6 +4,7 @@ set -euo pipefail
 if [[ "${1:-}" != "--i-understand" ]]; then
   echo "Motion stays disarmed by design." >&2
   echo "Clear the area, hold the physical controller/E-stop, verify RViz and LiDAR," >&2
+  echo "and be prepared for automatic RecoveryStand/BalanceStand posture motion," >&2
   echo "then run: $0 --i-understand" >&2
   exit 2
 fi

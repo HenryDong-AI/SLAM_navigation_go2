@@ -1,0 +1,88 @@
+depth_camera_bridge:
+  ros__parameters:
+    # Leave empty to select the first RealSense. The installed D435i was
+    # detected as serial 250122076106 during setup.
+    serial_number: ""
+    width: 640
+    height: 480
+    fps: 15
+    publish_rate_hz: 15.0
+    # The D435i on this device can remain enumerated while its stream stalls.
+    # Because this bridge exclusively owns it, reset only that USB camera and
+    # restart capture when no frames arrive.
+    no_frame_timeout_sec: 3.0
+    auto_hardware_reset: true
+    hardware_reset_wait_sec: 5.0
+    frame_id: d435i_color_optical_frame
+    color_topic: /go2/depth_camera/color/image_raw
+    depth_topic: /go2/depth_camera/aligned_depth/image_raw
+    color_info_topic: /go2/depth_camera/color/camera_info
+    depth_info_topic: /go2/depth_camera/aligned_depth/camera_info
+    status_topic: /go2/depth_camera/status
+
+go2_mapping_depthcam:
+  ros__parameters:
+    depth_topic: /go2/depth_camera/aligned_depth/image_raw
+    camera_info_topic: /go2/depth_camera/aligned_depth/camera_info
+    odom_topic: /go2/odom
+    time_sync_topic: /go2/time_sync/status
+    map_cloud_topic: /go2/map/cloud
+    map_topic: /map
+    mapping_status_topic: /go2/mapping/status
+    world_frame: odom
+    base_frame: base_link
+    expected_depth_frame: d435i_color_optical_frame
+    time_sync_required: true
+
+    # Measured on this Go2 by registering 30 stationary D435i depth/LiDAR
+    # pairs on 2026-08-28. Validation: 0.0438 m nearest-surface RMSE and
+    # 96.5% overlap. This is T_base_link_from_d435i_color_optical_frame.
+    extrinsics_confirmed: true
+    base_from_camera_optical:
+      [0.02872632, -0.16499669, 0.98587570, 0.41930855,
+       -0.99949750, -0.01796270, 0.02611698, 0.04548966,
+       0.01339977, -0.98613054, -0.16542978, 0.09202389,
+       0.0, 0.0, 0.0, 1.0]
+
+    processing_rate_hz: 5.0
+    pixel_stride: 4
+    min_depth: 0.20
+    max_depth: 5.0
+    max_points_per_frame: 20000
+    max_depth_age_sec: 0.50
+    max_odom_delta_sec: 0.15
+    odom_buffer_size: 100
+
+    voxel_size: 0.08
+    min_point_range: 0.20
+    max_point_range: 5.0
+    min_relative_z: -0.50
+    max_relative_z: 2.00
+    max_voxels: 300000
+    retention_radius: 0.0
+
+    grid_resolution: 0.10
+    obstacle_min_height: -0.22
+    obstacle_max_height: 0.50
+    hit_log_odds: 0.85
+    miss_log_odds: -0.40
+    min_log_odds: -2.0
+    max_log_odds: 3.5
+    max_grid_cells: 500000
+    max_rays_per_update: 4000
+    max_ray_cells: 4096
+    max_dense_grid_cells: 4000000
+
+    publish_rate_hz: 1.0
+    output_directory: /home/unitree/SLAM_nav/maps_depth_camera
+    load_state_path: ""
+    auto_save_period_sec: 60.0
+    save_free_threshold: 25
+    save_occupied_threshold: 65
+
+rgbd_viewer:
+  ros__parameters:
+    color_topic: /go2/depth_camera/color/image_raw
+    depth_topic: /go2/depth_camera/aligned_depth/image_raw
+    window_name: "Go2 D435i RGB | RGB-D"
+    max_visual_depth: 5.0

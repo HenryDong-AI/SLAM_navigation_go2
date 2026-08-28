@@ -10,6 +10,7 @@
 
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>go2_mapping</exec_depend>
+  <exec_depend>go2_mapping_depthcam</exec_depend>
   <exec_depend>go2_navigation</exec_depend>
   <exec_depend>go2_robot_bridge</exec_depend>
   <exec_depend>go2_semantic_mapping</exec_depend>

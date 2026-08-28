@@ -8,7 +8,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
 
@@ -25,6 +25,7 @@ def _include(package, filename, arguments, condition=None):
 
 def generate_launch_description():
     mapping_share = get_package_share_directory("go2_mapping")
+    depth_mapping_share = get_package_share_directory("go2_mapping_depthcam")
     semantic_share = get_package_share_directory("go2_semantic_mapping")
     navigation_share = get_package_share_directory("go2_navigation")
 
@@ -39,6 +40,10 @@ def generate_launch_description():
     use_rviz = LaunchConfiguration("use_rviz")
     use_sim_time = LaunchConfiguration("use_sim_time")
     mapping_config = LaunchConfiguration("mapping_config")
+    mapping_backend = LaunchConfiguration("mapping_backend")
+    depth_mapping_config = LaunchConfiguration("depth_mapping_config")
+    depth_camera_python = LaunchConfiguration("depth_camera_python")
+    use_depth_viewer = LaunchConfiguration("use_depth_viewer")
     semantic_config = LaunchConfiguration("semantic_config")
     navigation_config = LaunchConfiguration("navigation_config")
     map_output_dir = LaunchConfiguration("map_output_dir")
@@ -74,6 +79,26 @@ def generate_launch_description():
                 default_value=os.path.join(mapping_share, "config", "mapping.yaml"),
             ),
             DeclareLaunchArgument(
+                "mapping_backend",
+                default_value="lidar",
+                choices=["lidar", "depth_camera"],
+                description="3D map source; exactly one mapping backend is started",
+            ),
+            DeclareLaunchArgument(
+                "depth_mapping_config",
+                default_value=os.path.join(
+                    depth_mapping_share, "config", "depth_mapping.yaml"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "depth_camera_python",
+                default_value=os.environ.get(
+                    "GO2_DEPTH_PYTHON",
+                    "/home/unitree/SLAM_nav/.conda/envs/slam_nav/bin/python",
+                ),
+            ),
+            DeclareLaunchArgument("use_depth_viewer", default_value="false"),
+            DeclareLaunchArgument(
                 "semantic_config",
                 default_value=os.path.join(semantic_share, "config", "semantic_mapping.yaml"),
             ),
@@ -107,6 +132,26 @@ def generate_launch_description():
                     "output_dir": map_output_dir,
                     "publish_odom_tf": "true",
                 },
+                condition=IfCondition(
+                    PythonExpression(["'", mapping_backend, "' == 'lidar'"])
+                ),
+            ),
+            _include(
+                "go2_mapping_depthcam",
+                "depth_mapping.launch.py",
+                {
+                    "params_file": depth_mapping_config,
+                    "python_executable": depth_camera_python,
+                    "start_camera": "true",
+                    "start_mapper": "true",
+                    "use_viewer": use_depth_viewer,
+                    "publish_odom_tf": "true",
+                },
+                condition=IfCondition(
+                    PythonExpression(
+                        ["'", mapping_backend, "' == 'depth_camera'"]
+                    )
+                ),
             ),
             _include(
                 "go2_semantic_mapping",

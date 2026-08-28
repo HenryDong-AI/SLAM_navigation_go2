@@ -83,6 +83,9 @@ class MappingNode(Node):
         )
         self.output_dir = str(self._parameter("output_dir", "~/go2_maps"))
         self.load_state_path = str(self._parameter("load_state_path", ""))
+        self.autosave_interval_sec = float(
+            self._parameter("autosave_interval_sec", 60.0)
+        )
         self.free_threshold = int(self._parameter("save_free_threshold", 25))
         self.occupied_threshold = int(
             self._parameter("save_occupied_threshold", 65)
@@ -92,6 +95,9 @@ class MappingNode(Node):
             raise ValueError("cloud and dense grid limits must be positive")
         if self.max_cloud_age_sec <= 0.0 or self.max_odom_age_sec <= 0.0:
             raise ValueError("message age limits must be positive")
+        if self.autosave_interval_sec < 0.0:
+            raise ValueError("autosave_interval_sec must be non-negative")
+        self._last_autosave_integrated_clouds = -1
 
         voxel_size = float(self._parameter("voxel_size", 0.10))
         min_point_range = float(self._parameter("min_point_range", 0.15))
@@ -211,10 +217,21 @@ class MappingNode(Node):
         )
         self._status_timer = self.create_timer(1.0 / status_rate, self._publish_status)
 
+        self._autosave_timer = None
+        if self.autosave_interval_sec > 0.0:
+            self._autosave_timer = self.create_timer(
+                self.autosave_interval_sec, self._autosave_callback
+            )
+
         self.get_logger().info(
             "mapping world-frame cloud %s with odometry %s in frame %s"
             % (self.cloud_topic, self.odom_topic, self.world_frame)
         )
+        if self.autosave_interval_sec > 0.0:
+            self.get_logger().info(
+                "automatic map snapshots every %.1f s below %s"
+                % (self.autosave_interval_sec, self.output_dir)
+            )
 
     def _parameter(self, name: str, default):
         self.declare_parameter(name, default)
@@ -481,6 +498,25 @@ class MappingNode(Node):
             response.message = "map save failed: {}".format(error)
         return response
 
+    def _autosave_callback(self) -> None:
+        if self.autosave_interval_sec <= 0.0:
+            return
+        with self._lock:
+            revision = self._counts["integrated_clouds"]
+            ready = self._time_sync_guard.ready
+            nonempty = len(self._voxels) > 0
+        if (
+            not ready
+            or not nonempty
+            or revision <= self._last_autosave_integrated_clouds
+        ):
+            return
+        response = Trigger.Response()
+        self._save_callback(None, response)
+        if response.success:
+            self._last_autosave_integrated_clouds = revision
+            self.get_logger().info("automatic map save: %s" % response.message)
+
     def _reset_callback(self, _request, response):
         with self._lock:
             self._voxels.clear()
@@ -563,6 +599,7 @@ def main(args=None) -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        node._autosave_callback()
         node.destroy_node()
         rclpy.shutdown()
 

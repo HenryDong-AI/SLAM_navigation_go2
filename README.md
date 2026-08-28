@@ -4,9 +4,11 @@ For the safe two-terminal startup and arming sequence, see
 [HOW_TO_RUN.md](HOW_TO_RUN.md).
 
 This ROS 2 Foxy workspace is built for the Unitree Go2 EDU onboard Jetson and
-its built-in L1 LiDAR and front RGB camera. It provides:
+its built-in L1 LiDAR and front RGB camera, with an optional Intel RealSense
+D435i backend. It provides:
 
 - bounded, persistent 3D voxel mapping from the firmware-deskewed L1 cloud;
+- selectable direct D435i RGB-D voxel mapping without the ROS RealSense driver;
 - live 2D occupancy projection with ray clearing for Nav2;
 - conservative goal and named-route navigation;
 - saved-map AMCL localization for repeat routes;
@@ -47,9 +49,10 @@ Unitree's firmware L1 odometry pipeline produces `/utlidar/cloud_deskewed` in
 is about 502 seconds behind the Jetson clock on this device. One bridge derives
 a shared offset and republishes `/go2/lidar/cloud_deskewed`, `/go2/odom`, and
 the base cloud in the Jetson ROS clock while preserving sensor-relative timing.
-It also rotates the mounted native axes into REP-103 (X forward, Y left, Z up)
-for clouds, pose, twist, and covariances. All project consumers use those
-normalized topics. The mapper accumulates the
+Measured data on this firmware is already REP-103 (X forward, Y left, Z up), so
+the bridge preserves cloud, pose, twist, and covariance coordinates by default.
+The former native-axis rotation remains an opt-in parameter for verified legacy
+firmware only. All project consumers use the normalized topics. The mapper accumulates the
 firmware-registered output without running a second heavy SLAM process on the
 Jetson. Topics remain parameters, so a loop-closing backend can instead feed
 verified registered-cloud and odometry inputs.
@@ -65,7 +68,8 @@ The workspace targets the inspected device baseline:
   `/utlidar/cloud_deskewed`, and `/utlidar/robot_odom`; and
 - Unitree SDK2 Python plus its no-shared-memory CycloneDDS build.
 
-No additional USB camera, RealSense, or external LiDAR is assumed.
+The default LiDAR backend needs no additional sensor. The optional depth-camera
+backend uses the installed USB Intel RealSense D435i.
 
 ## Build
 
@@ -89,10 +93,11 @@ source scripts/env.sh
 installed no-SHM Unitree SDK runtime. This ordering is required on this device;
 the system `/usr/local` DDS library can crash Python SDK RPC writers.
 
-### Optional project-local Conda environment for YOLO
+### Project-local Conda environment for YOLO and D435i
 
 The core ROS 2 nodes intentionally remain on Foxy's `/usr/bin/python3`. Create
-and activate the Python 3.8 Conda environment for the semantic YOLO node with:
+and activate the Python 3.8 Conda environment for the semantic YOLO node and
+direct D435i capture with:
 
 ```bash
 cd /home/unitree/SLAM_nav
@@ -111,11 +116,14 @@ This installs ARM64 Miniforge under `.miniforge3`, creates the environment at
 Torch/Ultralytics packages. It does not install a generic Torch build. Sourcing
 `activate_conda.sh` also sources the ROS/device environment and sets
 `GO2_SEMANTIC_PYTHON`. Once the environment exists, the regular `env.sh` and
-mapping startup scripts also select it automatically for the semantic node.
+mapping startup scripts also select it automatically for the semantic and
+depth-camera nodes. The environment pins `pyrealsense2==2.55.1.6486`; this
+avoids the device's obsolete ROS1 RealSense driver.
 
-Do not reuse maps, routes, or camera extrinsics produced against a raw
-positive-Z-down `/utlidar` convention. This workspace's outputs and calibration
-are explicitly REP-103 `/go2` data.
+Do not reuse maps, routes, or camera extrinsics produced before the firmware
+coordinate audit: the former bridge configuration inverted Y/Z and placed the
+floor above the robot. Current `/go2` outputs preserve the firmware's verified
+REP-103 coordinates.
 
 ## Calibrate before semantic fusion
 
@@ -137,8 +145,145 @@ Start the complete stack:
 ./scripts/start_mapping.sh
 ```
 
-This starts the camera bridge, mapper, semantic mapper, Nav2, and RViz. It does
-not stand the robot and it does not enable motion. First verify:
+Run only one complete stack at a time. `start_mapping.sh` now refuses to start
+when another `/go2/time_sync/status` publisher or project stack lock exists.
+If `sensor time bridge process changed` is reported, stop every complete stack,
+wait for the publisher to disappear, and start exactly one fresh stack. The
+fault is intentionally restart-latched and cannot be cleared by re-enabling
+motion inside the affected process.
+
+This starts the camera bridge, mapper, semantic mapper, Nav2, and RViz. RViz
+requires a graphical desktop; for a headless or plain SSH terminal, start the
+stack without it:
+
+```bash
+./scripts/start_mapping.sh use_rviz:=false
+```
+
+The LiDAR mapper remains the default. Select exactly one geometric map backend:
+
+```bash
+# Built-in L1 LiDAR (default)
+./scripts/start_mapping.sh mapping_backend:=lidar
+
+# Installed D435i; optionally opens the RGB/RGB-D viewer
+./scripts/start_mapping.sh mapping_backend:=depth_camera use_depth_viewer:=true
+```
+
+The depth-camera backend bypasses `go2_mapping_node` but keeps its public map
+topics and Nav2 interfaces. Its
+`base_link <- d435i_color_optical_frame` transform was measured on this Go2
+by registering 30 stationary D435i/LiDAR pairs (4.38 cm nearest-surface RMSE,
+96.5% overlap). The result is stored in
+`src/go2_mapping_depthCam/config/depth_mapping.yaml`.
+
+If the D435i bracket is moved, keep the robot stationary in a scene containing
+several non-parallel surfaces and recalibrate while the complete stack runs:
+
+```bash
+source /opt/ros/foxy/setup.bash
+source install/setup.bash
+ros2 run go2_mapping_depthcam extrinsic_calibrator \
+  --ros-args -p sample_count:=30
+```
+
+Only accept output that reports `credible: true`. Copy its complete
+`base_from_camera_optical` matrix into `depth_mapping.yaml`, rebuild
+`go2_mapping_depthcam`, and restart the complete stack.
+
+### Depth-camera full stack: two terminals
+
+Use only one full-stack process. In **terminal 1**, start the stack and leave it
+running:
+
+```bash
+cd /home/unitree/SLAM_nav
+conda activate slam_nav
+./scripts/start_mapping.sh \
+  mapping_backend:=depth_camera \
+  use_rviz:=true \
+  use_depth_viewer:=true
+```
+
+In **terminal 2**, load the same environment and check each status. Stop each
+`ros2 topic echo` with Ctrl-C before running the next command:
+
+```bash
+cd /home/unitree/SLAM_nav
+conda activate slam_nav
+source scripts/env.sh
+
+ros2 topic echo -f /go2/time_sync/status
+# Continue only after it reports: "state":"locked"
+
+ros2 topic echo -f /go2/depth_camera/status
+# It must report: "state":"streaming"
+
+ros2 topic echo -f /go2/mapping/status
+# It must report: "state": "mapping" and an increasing voxel_count
+
+./scripts/enable_motion.sh --i-understand
+```
+
+The robot moves only after motion is enabled and a Nav2 goal or valid
+`/cmd_vel` command is sent. Keep terminal 2 available for the emergency software
+stop:
+
+```bash
+./scripts/stop_motion.sh
+```
+
+When finished, stop motion in terminal 2 first, then press Ctrl-C in terminal 1.
+If no graphical display is available, set both `use_rviz:=false` and
+`use_depth_viewer:=false` in terminal 1.
+
+To test just the direct camera and viewer without the full stack, run:
+
+```bash
+./scripts/start_depth_camera.sh
+```
+
+### Open RViz
+
+From a graphical terminal on the Go2 computer, open a second terminal and run:
+
+```bash
+cd /home/unitree/SLAM_nav
+conda activate slam_nav                 # omit if it is already active
+source scripts/env.sh
+rviz2 -d src/go2_navigation/rviz/go2_navigation.rviz
+```
+
+The default `./scripts/start_mapping.sh` command already runs this RViz
+configuration, so do not start a second copy unless the stack was launched with
+`use_rviz:=false` or RViz was closed.
+
+For remote SSH use, connect with X11 forwarding from a computer that has an X
+server or use a remote-desktop session:
+
+```bash
+ssh -Y ziming@192.168.123.99
+echo "$DISPLAY"                       # must print a non-empty value
+cd /home/unitree/SLAM_nav
+source scripts/env.sh
+rviz2 -d src/go2_navigation/rviz/go2_navigation.rviz
+```
+
+If Qt reports `could not connect to display`, the SSH/desktop display is not
+available; reinstalling RViz or the `xcb` plugin is not the fix. In RViz, use
+`base_link` as the live-session fixed frame and enable these configured
+displays:
+
+- **3D Map**: `/go2/map/cloud`
+- **PointCloud**: `/go2/lidar/cloud_base`
+- **Semantic 3D Map**: `/go2/semantic/cloud`
+- **Robot Odometry**: `/go2/odom`
+
+The stack does not change robot posture and it does not enable motion. On
+explicit enable, the motion worker detects and verifies the firmware's `mcf`
+controller (or legacy
+`sport_mode`), reads the robot's standing height, and runs the proven recovery
+sequence if the robot is too low before accepting commands. First verify:
 
 ```bash
 ros2 topic hz /utlidar/cloud_deskewed
@@ -201,6 +346,12 @@ The geometric mapper writes a timestamped directory containing the 3D PLY,
 2D PGM/YAML, reloadable NPZ state, and metadata. The semantic mapper writes a
 semantic PLY plus JSON class-vote and calibration metadata.
 
+The selected geometric map is also saved automatically every 60 seconds after
+new frames are fused and once more on a clean shutdown. LiDAR snapshots use
+`maps/go2_map_<timestamp>/`; D435i snapshots use
+`maps_depth_camera/go2_map_<timestamp>/`. Both contain the same atomic PLY,
+PGM/YAML, and reloadable NPZ state.
+
 For saved-map navigation after restart:
 
 ```bash
@@ -220,6 +371,8 @@ continued processing.
 | `/go2/odom`, `/go2/lidar/cloud_base`, `/go2/lidar/cloud_deskewed` | Host-clock-normalized Go2 sensors |
 | `/go2/time_sync/status` | Sensor clock offset and stream health |
 | `/go2/map/cloud` | accumulated geometric 3D voxel map |
+| `/go2/depth_camera/color/image_raw` | D435i RGB image (depth backend) |
+| `/go2/depth_camera/aligned_depth/image_raw` | aligned `32FC1` depth in metres |
 | `/map` | live 2D occupancy grid for Nav2 |
 | `/go2/semantic/cloud` | labeled/colorized semantic 3D voxels |
 | `/go2/semantic/markers` | class labels in RViz |

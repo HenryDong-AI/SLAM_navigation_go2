@@ -39,6 +39,18 @@ class TimeSyncStatusGuardTest(unittest.TestCase):
             self.assertTrue(guard.update(changed))
             self.assertFalse(guard.ready)
 
+    def test_bridge_fault_reason_wins_when_epoch_changes_too(self):
+        guard = TimeSyncStatusGuard()
+        guard.update(self.status())
+        reason = guard.update(
+            self.status(
+                state="fault_latched",
+                epoch=1,
+                fault_reason="odometry translation rate was invalid",
+            )
+        )
+        self.assertEqual(reason, "odometry translation rate was invalid")
+
 
 if __name__ == "__main__":
     unittest.main()

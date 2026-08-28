@@ -75,10 +75,11 @@ printf '%s\n' \
   > "${target_site}/go2_system_site_packages.pth"
 
 export GO2_SEMANTIC_PYTHON="${env_prefix}/bin/python"
+export GO2_DEPTH_PYTHON="${env_prefix}/bin/python"
 # shellcheck disable=SC1091
 source "${project_root}/scripts/env.sh"
 "${env_prefix}/bin/python" -c \
-  'import sys, numpy, cv2, cv_bridge, rclpy, torch, ultralytics; assert torch.cuda.is_available(); print("Validated Python {}, Torch {}, Ultralytics {}, CUDA available".format(sys.version.split()[0], torch.__version__, ultralytics.__version__))'
+  'import sys, numpy, cv2, pyrealsense2, rclpy, torch, ultralytics; assert torch.cuda.is_available(); print("Validated Python {}, Torch {}, Ultralytics {}, pyrealsense2, CUDA available".format(sys.version.split()[0], torch.__version__, ultralytics.__version__))'
 
 echo
 echo "Conda environment ready: ${env_prefix}"

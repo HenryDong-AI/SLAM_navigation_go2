@@ -4,6 +4,10 @@ channels:
 dependencies:
   - python=3.8
   - pip
+  - pip:
+      # Direct D435i capture; avoids the device's obsolete ROS1 RealSense
+      # driver and its depth-stream watchdog failures.
+      - pyrealsense2==2.55.1.6486
 
 # Jetson's CUDA-enabled Torch and the proven Ultralytics stack are mirrored
 # from the device's existing detector venv by scripts/create_conda_env.sh.

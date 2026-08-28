@@ -96,13 +96,13 @@ class TimeSyncInterlock:
             self.epoch = epoch
         elif instance_id != self.instance_id:
             return self.latch("sensor time bridge process changed")
-        elif epoch != self.epoch:
-            return self.latch("sensor time epoch changed")
         if state == "fault_latched":
             return self.latch(
                 str(payload.get("fault_reason", "")).strip()
                 or "sensor time bridge reported a fault"
             )
+        if epoch != self.epoch:
+            return self.latch("sensor time epoch changed")
         if self.ever_locked and state != "locked":
             return self.latch("sensor time bridge left the locked state")
         self.state = state

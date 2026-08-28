@@ -16,7 +16,7 @@ from rclpy.qos import (
     QoSProfile,
     QoSReliabilityPolicy,
 )
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import String
 
 from .coordinates import (
@@ -24,12 +24,15 @@ from .coordinates import (
     TRANSFORM_NAME,
     transform_odometry_in_place,
     transform_pointcloud_in_place,
+    sample_pointcloud_xyz,
 )
 from .periodic_worker import PeriodicScheduler
 from .time_sync import OdomPoseGuard, SharedTimeEstimator, TimeSyncReset
 
 
 NANOSECONDS = 1000000000
+IDENTITY_TRANSFORM_NAME = "identity_rep103"
+IDENTITY_AXIS_SIGNS = (1.0, 1.0, 1.0)
 
 
 def stamp_to_ns(stamp) -> int:
@@ -68,6 +71,11 @@ class SensorTimeBridge(Node):
         self._declare(
             "cloud_deskewed_topic", "/go2/lidar/cloud_deskewed"
         )
+        self._declare(
+            "calibration_cloud_topic", "/go2/lidar/cloud_calibration"
+        )
+        self._declare("calibration_cloud_rate_hz", 1.0)
+        self._declare("calibration_cloud_max_points", 5000)
         self._declare("status_topic", "/go2/time_sync/status")
         self._declare("warmup_samples", 30)
         self._declare("rolling_window_samples", 200)
@@ -79,10 +87,20 @@ class SensorTimeBridge(Node):
         self._declare("expected_base_frame", "base_link")
         self._declare("expected_cloud_base_frame", "base_link")
         self._declare("expected_cloud_deskewed_frame", "odom")
+        # Current Go2 firmware already publishes REP-103 coordinates. Keep the
+        # former Rx(pi) conversion only as an explicit legacy-firmware option.
+        self._declare("apply_native_axis_conversion", False)
         self._declare("max_odom_translation_step", 0.75)
         self._declare("max_odom_translation_speed", 3.0)
         self._declare("max_odom_angular_step", 1.5707963267948966)
         self._declare("max_odom_angular_speed", 8.0)
+        # Unitree odometry arrives near 150 Hz and may apply small LIO pose
+        # corrections. Measure rate over a meaningful interval instead of
+        # treating one sub-centisecond correction as physical velocity.
+        self._declare("odom_rate_window_sec", 0.10)
+        self._apply_native_axis_conversion = bool(
+            self._value("apply_native_axis_conversion")
+        )
 
         self._estimator = SharedTimeEstimator(
             warmup_samples=int(self._value("warmup_samples")),
@@ -102,11 +120,33 @@ class SensorTimeBridge(Node):
             ),
             max_angular_step=float(self._value("max_odom_angular_step")),
             max_angular_speed=float(self._value("max_odom_angular_speed")),
+            rate_window_interval_ns=self._seconds_ns("odom_rate_window_sec"),
         )
         status_rate = float(self._value("status_publish_rate"))
         if status_rate <= 0.0:
             raise ValueError("status_publish_rate must be positive")
         self._status_publish_rate = status_rate
+        calibration_rate = float(self._value("calibration_cloud_rate_hz"))
+        if calibration_rate < 0.0:
+            raise ValueError("calibration_cloud_rate_hz must not be negative")
+        self._calibration_period = (
+            1.0 / calibration_rate if calibration_rate > 0.0 else 0.0
+        )
+        self._calibration_max_points = int(
+            self._value("calibration_cloud_max_points")
+        )
+        if self._calibration_max_points <= 0:
+            raise ValueError("calibration_cloud_max_points must be positive")
+        self._last_calibration_publish = 0.0
+        if self._apply_native_axis_conversion:
+            self.get_logger().warning(
+                "legacy native-axis conversion is enabled: (x,y,z)->(x,-y,-z)"
+            )
+        else:
+            self.get_logger().info(
+                "firmware odometry and LiDAR axes are passed through "
+                "as REP-103"
+            )
 
         raw_qos = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -126,6 +166,12 @@ class SensorTimeBridge(Node):
             reliability=QoSReliabilityPolicy.RELIABLE,
             durability=QoSDurabilityPolicy.VOLATILE,
         )
+        calibration_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
 
         self._odom_publisher = self.create_publisher(
             Odometry, str(self._value("odom_topic")), normalized_qos
@@ -140,6 +186,11 @@ class SensorTimeBridge(Node):
         )
         self._status_publisher = self.create_publisher(
             String, str(self._value("status_topic")), status_qos
+        )
+        self._calibration_publisher = self.create_publisher(
+            PointCloud2,
+            str(self._value("calibration_cloud_topic")),
+            calibration_qos,
         )
 
         self._odom_subscription = self.create_subscription(
@@ -167,6 +218,7 @@ class SensorTimeBridge(Node):
             "published_odom": 0,
             "published_cloud_base": 0,
             "published_cloud_deskewed": 0,
+            "published_calibration_cloud": 0,
             "dropped_warmup": 0,
             "dropped_invalid": 0,
             "dropped_fault_latched": 0,
@@ -237,7 +289,8 @@ class SensorTimeBridge(Node):
             if parent != expected_parent or child != expected_child:
                 self._estimator.reset("unexpected odometry frames")
                 self._latch_fault(
-                    "odometry frames '{} -> {}' do not match '{} -> {}'".format(
+                    "odometry frames '{} -> {}' do not match "
+                    "'{} -> {}'".format(
                         parent, child, expected_parent, expected_child
                     )
                 )
@@ -271,7 +324,8 @@ class SensorTimeBridge(Node):
                 return
             try:
                 assign_stamp(message.header.stamp, normalized_ns)
-                transform_odometry_in_place(message)
+                if self._apply_native_axis_conversion:
+                    transform_odometry_in_place(message)
             except ValueError as error:
                 self._estimator.reset(str(error))
                 self._latch_fault(str(error))
@@ -336,17 +390,66 @@ class SensorTimeBridge(Node):
                 return
             if normalized_ns is None:
                 self._counters["dropped_warmup"] += 1
-                self._last_event = "{} dropped during clock warmup".format(stream)
+                self._last_event = (
+                    "{} dropped during clock warmup".format(stream)
+                )
                 return
             try:
                 assign_stamp(message.header.stamp, normalized_ns)
-                transform_pointcloud_in_place(message)
+                if self._apply_native_axis_conversion:
+                    transform_pointcloud_in_place(message)
             except ValueError as error:
                 self._estimator.reset(str(error))
                 self._latch_fault(str(error))
                 return
             publisher.publish(message)
             self._counters[published_counter] += 1
+            if stream == "cloud_base":
+                self._publish_calibration_cloud(message)
+
+    def _publish_calibration_cloud(self, source: PointCloud2) -> None:
+        """Publish bounded XYZ only while calibration listens."""
+
+        if (
+            self._calibration_period <= 0.0
+            or self._calibration_publisher.get_subscription_count() == 0
+        ):
+            return
+        now = time.monotonic()
+        if now - self._last_calibration_publish < self._calibration_period:
+            return
+        try:
+            points = sample_pointcloud_xyz(
+                source, self._calibration_max_points
+            )
+        except ValueError as error:
+            self.get_logger().warning(
+                "calibration cloud sampling failed: %s" % error
+            )
+            return
+        message = PointCloud2()
+        message.header = source.header
+        message.height = 1
+        message.width = int(points.shape[0])
+        message.fields = [
+            PointField(
+                name="x", offset=0, datatype=PointField.FLOAT32, count=1
+            ),
+            PointField(
+                name="y", offset=4, datatype=PointField.FLOAT32, count=1
+            ),
+            PointField(
+                name="z", offset=8, datatype=PointField.FLOAT32, count=1
+            ),
+        ]
+        message.is_bigendian = False
+        message.point_step = 12
+        message.row_step = message.point_step * message.width
+        message.data = points.astype("<f4", copy=False).tobytes()
+        message.is_dense = bool(source.is_dense)
+        self._calibration_publisher.publish(message)
+        self._last_calibration_publish = now
+        self._counters["published_calibration_cloud"] += 1
 
     def _publish_status(self) -> None:
         if not self._status_deadline_announced:
@@ -362,11 +465,21 @@ class SensorTimeBridge(Node):
                 payload["state"] = "fault_latched"
             payload["fault_reason"] = self._fault_reason
             payload["last_event"] = self._last_event
-            payload["coordinate_transform"] = TRANSFORM_NAME
-            payload["coordinate_axis_signs"] = list(AXIS_SIGNS)
+            payload["coordinate_transform"] = (
+                TRANSFORM_NAME
+                if self._apply_native_axis_conversion
+                else IDENTITY_TRANSFORM_NAME
+            )
+            payload["coordinate_axis_signs"] = list(
+                AXIS_SIGNS
+                if self._apply_native_axis_conversion
+                else IDENTITY_AXIS_SIGNS
+            )
             payload["counters"] = dict(self._counters)
         message = String()
-        message.data = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        message.data = json.dumps(
+            payload, sort_keys=True, separators=(",", ":")
+        )
         self._status_publisher.publish(message)
 
 

@@ -15,7 +15,7 @@ go2_mapping:
     # The registered L1 cloud contains zero-padded slots close to the robot.
     min_point_range: 0.15
     max_point_range: 15.0
-    # sensor_time_bridge converts the mounted L1 convention to REP-103 Z-up.
+    # Current firmware already publishes REP-103 Z-up; the bridge preserves it.
     min_relative_z: -1.0
     max_relative_z: 3.0
     max_voxels: 300000
@@ -48,6 +48,10 @@ go2_mapping:
 
     output_dir: ~/go2_maps
     load_state_path: ""
+    # Periodically save the latest fused map using the existing atomic snapshot
+    # format. Zero disables autosave.
+    autosave_interval_sec: 60.0
+
     # OccupancyGrid probabilities classified into white/black PGM pixels.
     # Intermediate and unknown cells use standard gray 205. map.yaml is always
     # written with map_server's strict 0.196/0.65 trinary thresholds so gray

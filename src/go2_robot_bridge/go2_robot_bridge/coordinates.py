@@ -24,7 +24,9 @@ SIX_DOF_SIGNS = (1.0, -1.0, -1.0, 1.0, -1.0, -1.0)
 TRANSFORM_NAME = "native_mount_to_rep103_rx_pi"
 
 
-def _finite_tuple(values: Iterable[float], size: int, label: str) -> Tuple[float, ...]:
+def _finite_tuple(
+    values: Iterable[float], size: int, label: str
+) -> Tuple[float, ...]:
     result = tuple(float(value) for value in values)
     if len(result) != size:
         raise ValueError("{} must contain {} values".format(label, size))
@@ -83,19 +85,32 @@ def _pointcloud_layout(message):
         if field.name in ("x", "y", "z"):
             if field.name in fields:
                 raise ValueError(
-                    "point cloud contains duplicate {} fields".format(field.name)
+                    "point cloud contains duplicate {} fields".format(
+                        field.name
+                    )
                 )
-            if int(field.datatype) != POINT_FIELD_FLOAT32 or int(field.count) != 1:
+            invalid_type = int(field.datatype) != POINT_FIELD_FLOAT32
+            if invalid_type or int(field.count) != 1:
                 raise ValueError(
-                    "point cloud {} must be one FLOAT32 value".format(field.name)
+                    "point cloud {} must be one FLOAT32 value".format(
+                        field.name
+                    )
                 )
             fields[field.name] = int(field.offset)
     if set(fields) != {"x", "y", "z"}:
         raise ValueError("point cloud lacks scalar FLOAT32 x/y/z fields")
     intervals = sorted((offset, offset + 4) for offset in fields.values())
-    if any(left[1] > right[0] for left, right in zip(intervals, intervals[1:])):
+    overlaps = any(
+        left[1] > right[0]
+        for left, right in zip(intervals, intervals[1:])
+    )
+    if overlaps:
         raise ValueError("point cloud x/y/z fields overlap")
-    if any(offset < 0 or offset + 4 > point_step for offset in fields.values()):
+    outside = any(
+        offset < 0 or offset + 4 > point_step
+        for offset in fields.values()
+    )
+    if outside:
         raise ValueError("point cloud x/y/z field falls outside point_step")
 
     required_size = height * row_step
@@ -141,6 +156,40 @@ def transform_pointcloud_data(message) -> bytearray:
     data = bytearray(message.data)
     _transform_pointcloud_buffer(message, data)
     return data
+
+
+def sample_pointcloud_xyz(message, max_points: int) -> np.ndarray:
+    """Return bounded XYZ samples without copying the complete cloud."""
+
+    width, height, point_step, row_step, fields, required_size = (
+        _pointcloud_layout(message)
+    )
+    limit = int(max_points)
+    if limit <= 0:
+        raise ValueError("max_points must be positive")
+    view = memoryview(message.data)
+    if view.nbytes < required_size:
+        raise ValueError("point cloud is shorter than height*row_step")
+    point_count = width * height
+    if point_count == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    sample_count = min(point_count, limit)
+    indices = np.linspace(
+        0, point_count - 1, num=sample_count, dtype=np.int64
+    )
+    rows, columns = np.divmod(indices, width)
+    dtype = np.dtype(">f4" if bool(message.is_bigendian) else "<f4")
+    result = np.empty((sample_count, 3), dtype=np.float32)
+    for output_column, axis in enumerate(("x", "y", "z")):
+        values = np.ndarray(
+            shape=(height, width),
+            dtype=dtype,
+            buffer=view,
+            offset=fields[axis],
+            strides=(row_step, point_step),
+        )
+        result[:, output_column] = values[rows, columns]
+    return result
 
 
 def transform_odometry_in_place(message) -> None:

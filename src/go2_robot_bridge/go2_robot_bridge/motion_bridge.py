@@ -61,8 +61,13 @@ class MotionBridge(Node):
         self.declare_parameter("stop_service", "/go2/motion/stop")
         self.declare_parameter("control_rate_hz", 20.0)
         self.declare_parameter("sdk_timeout_sec", 1.0)
+        self.declare_parameter("controller_rpc_timeout_sec", 5.0)
+        self.declare_parameter("controller_transition_timeout_sec", 15.0)
+        self.declare_parameter("auto_prepare_posture", True)
+        self.declare_parameter("sport_state_timeout_sec", 5.0)
+        self.declare_parameter("standing_min_body_height", 0.25)
         self.declare_parameter("sdk_reconnect_delay_sec", 2.0)
-        self.declare_parameter("worker_startup_timeout_sec", 5.0)
+        self.declare_parameter("worker_startup_timeout_sec", 45.0)
         self.declare_parameter("worker_rpc_timeout_sec", 1.5)
         self.declare_parameter("worker_reap_timeout_sec", 2.0)
         self.declare_parameter("post_worker_sensor_refresh_timeout_sec", 2.0)
@@ -111,6 +116,22 @@ class MotionBridge(Node):
             self.get_parameter("cyclonedds_python_path").value
         )
         self._sdk_timeout = max(0.1, float(self.get_parameter("sdk_timeout_sec").value))
+        self._controller_rpc_timeout = max(
+            0.1, float(self.get_parameter("controller_rpc_timeout_sec").value)
+        )
+        self._controller_transition_timeout = max(
+            0.1,
+            float(self.get_parameter("controller_transition_timeout_sec").value),
+        )
+        self._auto_prepare_posture = bool(
+            self.get_parameter("auto_prepare_posture").value
+        )
+        self._sport_state_timeout = max(
+            0.1, float(self.get_parameter("sport_state_timeout_sec").value)
+        )
+        self._standing_min_body_height = max(
+            0.01, float(self.get_parameter("standing_min_body_height").value)
+        )
         self._reconnect_delay = max(
             0.1, float(self.get_parameter("sdk_reconnect_delay_sec").value)
         )
@@ -295,7 +316,8 @@ class MotionBridge(Node):
             self._stop_callback,
         )
         self.get_logger().warning(
-            "motion bridge started DISARMED; it never stands the robot automatically"
+            "motion bridge started DISARMED; explicit enable verifies posture "
+            "and may recover the robot to BalanceStand"
         )
 
     def _warn_limited(self, key: str, message: str, period: float = 5.0) -> None:
@@ -305,6 +327,9 @@ class MotionBridge(Node):
             self.get_logger().warning(message)
 
     def _disarm_for_fault(self, reason: str, permanent: bool = False) -> None:
+        already_latched = permanent and self._safety_fault.faulted
+        if already_latched and not self._armed:
+            return
         if permanent:
             reason = self._safety_fault.latch(reason)
         was_armed = self._armed
@@ -317,7 +342,7 @@ class MotionBridge(Node):
         sent = self._send_stop(force=True)
         self._close_worker()
         qualifier = "LATCHED " if permanent else ""
-        if was_armed or permanent:
+        if was_armed or (permanent and not already_latched):
             self.get_logger().error(
                 "motion DISARMED by %ssafety fault: %s" % (qualifier, reason)
             )
@@ -380,6 +405,13 @@ class MotionBridge(Node):
             self._motion_worker = MotionWorkerProxy.start(
                 network_interface=self._interface,
                 sdk_timeout_sec=self._sdk_timeout,
+                controller_rpc_timeout_sec=self._controller_rpc_timeout,
+                controller_transition_timeout_sec=(
+                    self._controller_transition_timeout
+                ),
+                auto_prepare_posture=self._auto_prepare_posture,
+                sport_state_timeout_sec=self._sport_state_timeout,
+                standing_min_body_height=self._standing_min_body_height,
                 startup_timeout_sec=self._worker_startup_timeout,
                 rpc_timeout_sec=self._worker_rpc_timeout,
                 reap_timeout_sec=self._worker_reap_timeout,
@@ -390,7 +422,17 @@ class MotionBridge(Node):
             )
             self._worker_was_armed = False
             self.get_logger().info(
-                "isolated SportClient worker is ready; motion remains DISARMED"
+                "isolated SportClient worker is ready with %s controller; "
+                "posture=%s body_height=%.3f m sport_mode=%d gait_type=%d "
+                "sport_error=%d; motion remains DISARMED"
+                % (
+                    self._motion_worker.controller,
+                    "recovered" if self._motion_worker.posture_prepared else "verified",
+                    self._motion_worker.body_height,
+                    self._motion_worker.sport_mode,
+                    self._motion_worker.gait_type,
+                    self._motion_worker.sport_error_code,
+                )
             )
             return True
         except Exception as exc:

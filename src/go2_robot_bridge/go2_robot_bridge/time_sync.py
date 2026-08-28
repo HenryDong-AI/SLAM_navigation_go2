@@ -19,6 +19,7 @@ class OdomPoseGuard:
         max_angular_step: float = 1.5707963267948966,
         max_angular_speed: float = 8.0,
         minimum_rate_interval_ns: int = 1000000,
+        rate_window_interval_ns: int = 100000000,
     ) -> None:
         limits = (
             max_translation_step,
@@ -30,14 +31,22 @@ class OdomPoseGuard:
             raise ValueError("pose continuity limits must be finite and positive")
         if int(minimum_rate_interval_ns) < 0:
             raise ValueError("minimum_rate_interval_ns must not be negative")
+        if int(rate_window_interval_ns) <= 0:
+            raise ValueError("rate_window_interval_ns must be positive")
         self.max_translation_step = float(max_translation_step)
         self.max_translation_speed = float(max_translation_speed)
         self.max_angular_step = float(max_angular_step)
         self.max_angular_speed = float(max_angular_speed)
         self.minimum_rate_interval_ns = int(minimum_rate_interval_ns)
+        self.rate_window_interval_ns = max(
+            int(rate_window_interval_ns), self.minimum_rate_interval_ns
+        )
         self._last_stamp_ns: Optional[int] = None
         self._last_position = None
         self._last_quaternion = None
+        self._rate_stamp_ns: Optional[int] = None
+        self._rate_position = None
+        self._rate_quaternion = None
 
     def observe(self, stamp_ns: int, position, quaternion) -> None:
         stamp_ns = int(stamp_ns)
@@ -85,20 +94,56 @@ class OdomPoseGuard:
                         angle, self.max_angular_step
                     )
                 )
-            if delta_ns >= self.minimum_rate_interval_ns:
-                delta_sec = delta_ns / 1.0e9
-                if translation / delta_sec > self.max_translation_speed:
-                    raise ValueError(
-                        "odometry translation rate exceeds {:.3f}m/s".format(
-                            self.max_translation_speed
+            rate_delta_ns = stamp_ns - self._rate_stamp_ns
+            if rate_delta_ns >= self.rate_window_interval_ns:
+                rate_translation = math.sqrt(
+                    sum(
+                        (current - previous) * (current - previous)
+                        for current, previous in zip(xyz, self._rate_position)
+                    )
+                )
+                rate_dot = abs(
+                    sum(
+                        current * previous
+                        for current, previous in zip(
+                            quaternion_unit, self._rate_quaternion
                         )
                     )
-                if angle / delta_sec > self.max_angular_speed:
+                )
+                rate_angle = 2.0 * math.acos(
+                    max(-1.0, min(1.0, rate_dot))
+                )
+                delta_sec = rate_delta_ns / 1.0e9
+                translation_rate = rate_translation / delta_sec
+                angular_rate = rate_angle / delta_sec
+                if translation_rate > self.max_translation_speed:
                     raise ValueError(
-                        "odometry angular rate exceeds {:.3f}rad/s".format(
-                            self.max_angular_speed
+                        "odometry translation rate {:.3f}m/s over {:.3f}s "
+                        "exceeds {:.3f}m/s ({:.3f}m displacement)".format(
+                            translation_rate,
+                            delta_sec,
+                            self.max_translation_speed,
+                            rate_translation,
                         )
                     )
+                if angular_rate > self.max_angular_speed:
+                    raise ValueError(
+                        "odometry angular rate {:.3f}rad/s over {:.3f}s "
+                        "exceeds {:.3f}rad/s ({:.3f}rad displacement)".format(
+                            angular_rate,
+                            delta_sec,
+                            self.max_angular_speed,
+                            rate_angle,
+                        )
+                    )
+                self._rate_stamp_ns = stamp_ns
+                self._rate_position = xyz
+                self._rate_quaternion = quaternion_unit
+
+        if self._rate_stamp_ns is None:
+            self._rate_stamp_ns = stamp_ns
+            self._rate_position = xyz
+            self._rate_quaternion = quaternion_unit
 
         self._last_stamp_ns = stamp_ns
         self._last_position = xyz

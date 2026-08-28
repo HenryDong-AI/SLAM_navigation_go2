@@ -70,6 +70,11 @@ match the current configuration. Saved trinary maps use gray 205 with strict
 `free_thresh: 0.196`, so Foxy map_server reloads unobserved cells as unknown
 rather than free.
 
+While mapping, `autosave_interval_sec` (60 seconds by default) writes a normal
+atomic timestamped snapshot after new clouds have been fused. A clean shutdown
+attempts one final snapshot. Set the interval to zero to disable autosave;
+manual `/go2/map/save` snapshots continue to work.
+
 Saving is rejected until the sensor-time boundary is locked and fault-free. A
 bridge process/epoch change, malformed status, or reported time fault clears
 the accumulated geometric state and latches the mapper; restart the complete

@@ -90,13 +90,40 @@ class OdomPoseGuardTest(unittest.TestCase):
             (0.0, 0.0, 0.0, -1.0),
         )
 
-    def test_translation_jump_and_rate_are_rejected(self):
+    def test_translation_jump_is_rejected(self):
         guard = OdomPoseGuard()
         guard.observe(1_000_000_000, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
         with self.assertRaisesRegex(ValueError, "translation"):
             guard.observe(
                 1_010_000_000,
                 (1.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0, 1.0),
+            )
+
+    def test_rate_uses_window_instead_of_adjacent_high_rate_samples(self):
+        guard = OdomPoseGuard(
+            max_translation_speed=3.0,
+            rate_window_interval_ns=100_000_000,
+        )
+        guard.observe(1_000_000_000, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+        # This individual 10 ms update looks like 4 m/s, but the 4 cm LIO
+        # correction is harmless when measured over a useful interval.
+        guard.observe(1_010_000_000, (0.04, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+        guard.observe(1_100_000_000, (0.05, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+
+    def test_sustained_translation_rate_is_rejected_with_details(self):
+        guard = OdomPoseGuard(
+            max_translation_speed=3.0,
+            rate_window_interval_ns=100_000_000,
+        )
+        guard.observe(1_000_000_000, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+        guard.observe(1_050_000_000, (0.2, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+        with self.assertRaisesRegex(
+            ValueError, "4.000m/s over 0.100s.*0.400m displacement"
+        ):
+            guard.observe(
+                1_100_000_000,
+                (0.4, 0.0, 0.0),
                 (0.0, 0.0, 0.0, 1.0),
             )
 

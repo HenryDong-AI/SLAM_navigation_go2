@@ -2,10 +2,14 @@
 
 - Test on a flat, clear floor with a second person holding the physical Go2
   controller and able to stop motion immediately.
-- The software bridge starts disarmed and never stands the robot automatically.
-- Arming starts the isolated SportClient while holding `StopMove`. Because that
-  startup blocks ROS callbacks briefly, the bridge requires new clock, odometry,
-  and LiDAR callbacks afterward before it accepts a new velocity command.
+- The software bridge starts disarmed and never changes posture merely because
+  the stack launched. The explicitly acknowledged enable operation reads
+  `rt/sportmodestate`; if body height is below the configured standing minimum,
+  it may execute `Damp` -> `RecoveryStand` -> `BalanceStand` before arming.
+- Arming starts the isolated SportClient while holding a controller-appropriate
+  zero-velocity stop. Because startup and possible posture recovery block ROS
+  callbacks briefly, the bridge requires new clock, odometry, and LiDAR
+  callbacks afterward before it accepts a new velocity command.
 - Confirm raw `/utlidar` inputs and normalized `/go2/lidar` plus `/go2/odom`
   are current, and that `/go2/time_sync/status` reports `locked`, before
   enabling motion. Any time/frame/pose discontinuity latches the boundary and
@@ -14,8 +18,11 @@
 - Start at the configured 0.35 m/s cap or lower. The L1 can miss low obstacles;
   do not rely on it for cables, glass, drop-offs, or objects below roughly
   0.3 m.
-- Keep Unitree obstacle avoidance and the physical E-stop available. Software
-  timeouts are additional safeguards, not an E-stop.
+- Current MCF firmware can acknowledge obstacle-avoidance API velocity without
+  moving. While the explicitly armed worker exists, it temporarily disables
+  Unitree obstacle avoidance and uses direct SportClient velocity behind this
+  project's fail-closed front-LiDAR gate. Disarming restores Unitree avoidance.
+  Keep the physical E-stop available; software safeguards are not an E-stop.
 - Stop motion before saving, calibration, inspecting a fault, changing network
   configuration, or restarting DDS.
 - A loss of normalized time status, odometry, or healthy LiDAR after arming is

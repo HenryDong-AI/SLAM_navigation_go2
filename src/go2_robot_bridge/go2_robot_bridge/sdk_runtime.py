@@ -34,11 +34,31 @@ def load_camera_sdk(sdk_path: str, cyclonedds_python_path: str) -> Tuple[Any, An
     return channel.ChannelFactoryInitialize, video.VideoClient
 
 
-def load_motion_sdk(sdk_path: str, cyclonedds_python_path: str) -> Tuple[Any, Any]:
+def load_motion_sdk(
+    sdk_path: str, cyclonedds_python_path: str
+) -> Tuple[Any, Any, Any, Any, Any, Any, Any]:
     configure_python_paths((sdk_path, cyclonedds_python_path))
     channel = importlib.import_module("unitree_sdk2py.core.channel")
     sport = importlib.import_module("unitree_sdk2py.go2.sport.sport_client")
-    return channel.ChannelFactoryInitialize, sport.SportClient
+    robot_state = importlib.import_module(
+        "unitree_sdk2py.go2.robot_state.robot_state_client"
+    )
+    motion_switcher = importlib.import_module(
+        "unitree_sdk2py.comm.motion_switcher.motion_switcher_client"
+    )
+    obstacles_avoid = importlib.import_module(
+        "unitree_sdk2py.go2.obstacles_avoid.obstacles_avoid_client"
+    )
+    sport_state = importlib.import_module("unitree_sdk2py.idl.unitree_go.msg.dds_")
+    return (
+        channel.ChannelFactoryInitialize,
+        channel.ChannelSubscriber,
+        sport.SportClient,
+        robot_state.RobotStateClient,
+        motion_switcher.MotionSwitcherClient,
+        obstacles_avoid.ObstaclesAvoidClient,
+        sport_state.SportModeState_,
+    )
 
 
 def no_shm_runtime_present(expected_fragment: str = "install_noshm/lib") -> bool:

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import unittest
 
 from go2_robot_bridge.coordinates import (
+    sample_pointcloud_xyz,
     transform_covariance,
     transform_odometry_in_place,
     transform_pointcloud_data,
@@ -22,6 +23,42 @@ def field(name, offset):
 
 
 class CoordinateConversionTest(unittest.TestCase):
+    def test_bounded_xyz_sampling_handles_organized_padding(self):
+        point_step = 16
+        row_step = 36
+        raw = bytearray(b"\xA5" * (2 * row_step))
+        points = (
+            (1.0, 2.0, 3.0, 10.0),
+            (4.0, 5.0, 6.0, 20.0),
+            (7.0, 8.0, 9.0, 30.0),
+            (10.0, 11.0, 12.0, 40.0),
+        )
+        for index, point in enumerate(points):
+            row, column = divmod(index, 2)
+            struct.pack_into(
+                "<ffff",
+                raw,
+                row * row_step + column * point_step,
+                *point
+            )
+        message = SimpleNamespace(
+            width=2,
+            height=2,
+            point_step=point_step,
+            row_step=row_step,
+            is_bigendian=False,
+            fields=[
+                field("x", 0),
+                field("y", 4),
+                field("z", 8),
+                field("intensity", 12),
+            ],
+            data=bytes(raw),
+        )
+        sampled = sample_pointcloud_xyz(message, max_points=2)
+        self.assertEqual(sampled.tolist(), [[1.0, 2.0, 3.0],
+                                            [10.0, 11.0, 12.0]])
+
     def test_vectors_quaternion_and_covariance_use_complete_basis_change(self):
         self.assertEqual(transform_xyz((1.0, 2.0, -3.0)), (1.0, -2.0, 3.0))
 
@@ -53,7 +90,12 @@ class CoordinateConversionTest(unittest.TestCase):
         )
         for index, point in enumerate(points):
             row, column = divmod(index, 2)
-            struct.pack_into("<ffff", raw, row * row_step + column * point_step, *point)
+            struct.pack_into(
+                "<ffff",
+                raw,
+                row * row_step + column * point_step,
+                *point
+            )
         message = SimpleNamespace(
             width=2,
             height=2,
@@ -75,7 +117,9 @@ class CoordinateConversionTest(unittest.TestCase):
             actual = struct.unpack_from(
                 "<ffff", converted, row * row_step + column * point_step
             )
-            self.assertEqual(actual, (source[0], -source[1], -source[2], source[3]))
+            self.assertEqual(
+                actual, (source[0], -source[1], -source[2], source[3])
+            )
         self.assertEqual(converted[32:36], raw[32:36])
         self.assertEqual(converted[68:72], raw[68:72])
         self.assertEqual(converted[72:], raw[72:])

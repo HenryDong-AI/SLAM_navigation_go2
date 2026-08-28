@@ -43,6 +43,10 @@ if [[ -z "${GO2_SEMANTIC_PYTHON:-}" ]]; then
   fi
   export GO2_SEMANTIC_PYTHON
 fi
+if [[ -z "${GO2_DEPTH_PYTHON:-}" ]]; then
+  GO2_DEPTH_PYTHON="${_go2_conda_semantic}"
+  export GO2_DEPTH_PYTHON
+fi
 if [[ -z "${GO2_CYCLONEDDS_PYTHON:-}" ]]; then
   GO2_CYCLONEDDS_PYTHON="$(python3 -m site --user-site)"
   export GO2_CYCLONEDDS_PYTHON

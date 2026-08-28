@@ -37,8 +37,8 @@ motion_bridge:
     front_max_x: 0.80
     front_half_width: 0.35
 
-    # sensor_time_bridge publishes REP-103 (+X forward, +Y left, +Z up).
-    # The floor is below the sensor and excluded from this obstacle band.
+    # Current firmware is already REP-103 (+X forward, +Y left, +Z up);
+    # sensor_time_bridge preserves it. The floor remains below the sensor.
     front_min_z: -0.22
     front_max_z: 0.50
     front_min_points: 5
@@ -49,10 +49,21 @@ motion_bridge:
     front_cloud_health_max_range: 30.0
 
     sdk_timeout_sec: 1.0
+    # Firmware before 1.1.6 exposes sport_mode; current firmware exposes mcf.
+    # The worker detects, starts, and verifies the correct controller only
+    # after the operator explicitly requests motion enable.
+    controller_rpc_timeout_sec: 5.0
+    controller_transition_timeout_sec: 15.0
+    # An explicit enable reads rt/sportmodestate. If body height is below the
+    # verified standing threshold, the isolated worker executes the proven
+    # Damp -> RecoveryStand -> BalanceStand sequence before it can arm.
+    auto_prepare_posture: true
+    sport_state_timeout_sec: 5.0
+    standing_min_body_height: 0.25
     sdk_reconnect_delay_sec: 2.0
     # SportClient lives in a non-ROS child because its Python CycloneDDS
     # binding cannot safely share a process with rclpy on this device.
-    worker_startup_timeout_sec: 5.0
+    worker_startup_timeout_sec: 45.0
     worker_rpc_timeout_sec: 1.5
     worker_reap_timeout_sec: 2.0
     # SportClient startup blocks the single-threaded ROS executor. Keep

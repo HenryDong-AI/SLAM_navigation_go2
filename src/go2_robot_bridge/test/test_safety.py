@@ -182,6 +182,20 @@ class TimeSyncInterlockTests(unittest.TestCase):
             self.assertFalse(interlock.ready)
             self.assertTrue(interlock.fault_reason)
 
+    def test_bridge_fault_reason_wins_when_epoch_changes_too(self):
+        interlock = TimeSyncInterlock()
+        interlock.update(self.status())
+        reason = interlock.update(
+            self.status(
+                state="fault_latched",
+                epoch=1,
+                fault_reason="odometry translation step 0.800m exceeds 0.750m",
+            )
+        )
+        self.assertEqual(
+            reason, "odometry translation step 0.800m exceeds 0.750m"
+        )
+
     def test_leaving_locked_state_and_bad_status_latch(self):
         interlock = TimeSyncInterlock()
         interlock.update(self.status())

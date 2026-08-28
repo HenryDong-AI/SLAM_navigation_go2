@@ -15,13 +15,20 @@ motion safety or sensor-clock state:
   Foxy's ROS CycloneDDS RMW cannot create a domain safely in one process on
   this device.
 - `motion_bridge` translates fresh, bounded `geometry_msgs/Twist` commands to
-  `SportClient.Move`. It starts **DISARMED**, never stands the robot, and stops
-  on stale commands, stale odometry, a forward obstacle, malformed/stale safety
-  cloud data, SDK failure, an explicit stop request, or shutdown. Because
+  `SportClient.Move`. It starts **DISARMED** and stops on stale commands, stale
+  odometry, a forward obstacle, malformed/stale safety cloud data, SDK failure,
+  an explicit stop request, or shutdown. Because
   Unitree's Python CycloneDDS binding and `rclpy` cannot safely initialize DDS
   domains in one process on this Go2, the ROS node never imports that SDK. It
   creates a private, non-ROS worker only after an explicit successful enable
-  request.
+  request. That worker detects `mcf` on current firmware or `sport_mode` on
+  legacy firmware, ensures the detected controller is running, and verifies
+  `mcf` selection and robot standing height before accepting velocity commands.
+  On current MCF firmware the obstacle-avoidance API can acknowledge velocity
+  while suppressing locomotion, so the armed worker follows the proven direct
+  SportClient path: it temporarily disables Unitree avoidance while the
+  project's fail-closed front-LiDAR gate is active, then restores Unitree
+  avoidance when the worker is stopped.
 
 This package does not copy implementation code from Unitree demos or the
 reference projects. It uses their public runtime interfaces only and is
@@ -33,17 +40,25 @@ Keep the physical remote/E-stop in an operator's hand whenever this node can
 reach the robot. Commission with the Go2 supported, in a clear stair-free
 area, at low speed. Software guards are not a substitute for the physical
 stop. The bridge deliberately does **not** call `StandUp`, `RecoveryStand`, or
-`BalanceStand`; put the robot in a stable standing mode with the official
-controller before arming this bridge.
+`BalanceStand` merely because the stack launches. The explicit enable operation
+may run `Damp` -> `RecoveryStand` -> `BalanceStand` if fresh sport-state
+telemetry reports a body height below `standing_min_body_height`. Keep the robot
+supported during initial commissioning and expect posture motion when enabling.
 
 Calling `/go2/motion/stop` is latching and disarms motion. Re-enabling always
 clears the cached command and requires a new `/cmd_vel` message.
 
 The motion worker receives bounded, length-framed JSON over a private inherited
 socket. Its dispatcher accepts only `Move(x, y, yaw)` and `StopMove()`; there is
-no remote path to standing, posture, or mode APIs. Every value is checked for
-finiteness. RPCs, startup, and process reaping are bounded by timeout, and the
-worker makes a final best-effort `StopMove` on parent EOF. An unconfirmed
+no remote path to standing, posture, or arbitrary mode APIs. The required
+firmware controller selection and posture preparation happen internally only
+during the explicit enable operation. Every value is checked for finiteness,
+and arming fails if fresh sport state or standing-height verification is
+unavailable. The semantic stop operation uses `Move(0, 0, 0)` on current `mcf`
+firmware, where the SDK's `StopMove()` returns `-1`, and retains `StopMove()`
+on legacy `sport_mode`. RPCs, startup, and process reaping are bounded by
+timeout, and the worker makes a final best-effort controller-appropriate stop
+on parent EOF. An unconfirmed
 `StopMove` or any SDK/transport failure after arming latches a restart-required
 safety fault. A disarmed bridge has no motion worker process.
 
@@ -97,10 +112,9 @@ for geometry-only operation; the semantic projection gate remains closed.
 The launch file loads motion limits and interlocks from `config/safety.yaml`.
 The obstacle guard consumes normalized `/go2/lidar/cloud_base` as a standard
 PointCloud2, and its odometry interlock consumes `/go2/odom`.
-The time boundary rotates the built-in sensor's mounted convention 180 degrees
-about X, so all `/go2` outputs use REP-103: X forward, Y left, and Z up. Its
-default vertical band excludes floor returns rather than treating them as
-obstacles.
+The current firmware's built-in streams are already REP-103: X forward, Y left,
+and Z up. The time boundary preserves those coordinates, so floor returns stay
+below the robot and are excluded by the default obstacle band.
 
 ### Native sensor clock boundary
 
@@ -113,9 +127,11 @@ delays, and reliably publishes `/go2/odom`, `/go2/lidar/cloud_base`, and
 best-effort sensor-data subscriptions while satisfying reliable recorders and
 scan-conversion nodes.
 
-The same boundary converts both clouds, the odometry pose and twist, and both
-6x6 covariances from the mounted native basis into REP-103. The status message
-reports `coordinate_transform=native_mount_to_rep103_rx_pi`.
+The same boundary preserves both clouds, the odometry pose and twist, and both
+6x6 covariances in the firmware's verified REP-103 basis. The status message
+reports `coordinate_transform=identity_rep103`. Set
+`apply_native_axis_conversion:=true` only for legacy firmware whose measured
+floor is positive Z and whose standing odometry height is negative Z.
 
 No message is emitted during warmup. After startup, a zero, repeated,
 regressing, stale, future, non-monotonic, unexpected-frame, or physically
@@ -134,14 +150,20 @@ source/output stamps, and per-stream receive/publish/drop counters.
 ## Arm, command, and stop
 
 The robot must already be stable, the time-sync state must be `locked`, and
-normalized `/go2/odom` must be fresh.
+normalized `/go2/odom` must be fresh. Enabling can take several seconds if the
+firmware's `mcf` controller is not already active. Wait for the response and
+the `motion command gate is ready` log before publishing a new command.
 
 ```bash
 ros2 service call /go2/motion/enable std_srvs/srv/SetBool "{data: true}"
-ros2 topic pub --rate 10 /cmd_vel geometry_msgs/msg/Twist \
+ros2 topic pub --rate 10 --times 20 --print 10 \
+  /cmd_vel geometry_msgs/msg/Twist \
   "{linear: {x: 0.10, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}"
 ros2 service call /go2/motion/stop std_srvs/srv/Trigger "{}"
 ```
+
+Use `--times` instead of wrapping `ros2 topic pub` in a short shell timeout:
+Foxy's DDS discovery can take more than two seconds before the first publish.
 
 Commands received while disarmed are discarded. A command stream must remain
 faster than `command_timeout_sec`. Forward motion also requires a fresh safety

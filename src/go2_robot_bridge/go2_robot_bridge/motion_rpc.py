@@ -124,6 +124,12 @@ class MotionWorkerProxy:
         process: Any,
         rpc_timeout_sec: float,
         reap_timeout_sec: float,
+        controller: str = "unknown",
+        posture_prepared: bool = False,
+        body_height: float = 0.0,
+        sport_mode: int = -1,
+        gait_type: int = -1,
+        sport_error_code: int = -1,
     ) -> None:
         self._peer: Optional[socket.socket] = peer
         self._process = process
@@ -131,6 +137,12 @@ class MotionWorkerProxy:
         self._reap_timeout = max(0.05, float(reap_timeout_sec))
         self._next_id = 1
         self._lock = threading.Lock()
+        self._controller = str(controller)
+        self._posture_prepared = bool(posture_prepared)
+        self._body_height = float(body_height)
+        self._sport_mode = int(sport_mode)
+        self._gait_type = int(gait_type)
+        self._sport_error_code = int(sport_error_code)
 
     @classmethod
     def start(
@@ -138,6 +150,11 @@ class MotionWorkerProxy:
         *,
         network_interface: str,
         sdk_timeout_sec: float,
+        controller_rpc_timeout_sec: float = 5.0,
+        controller_transition_timeout_sec: float = 15.0,
+        auto_prepare_posture: bool = True,
+        sport_state_timeout_sec: float = 5.0,
+        standing_min_body_height: float = 0.25,
         startup_timeout_sec: float,
         rpc_timeout_sec: float,
         reap_timeout_sec: float,
@@ -162,6 +179,14 @@ class MotionWorkerProxy:
                 str(network_interface),
                 "--sdk-timeout-sec",
                 str(max(0.05, float(sdk_timeout_sec))),
+                "--controller-rpc-timeout-sec",
+                str(max(0.1, float(controller_rpc_timeout_sec))),
+                "--controller-transition-timeout-sec",
+                str(max(0.1, float(controller_transition_timeout_sec))),
+                "--sport-state-timeout-sec",
+                str(max(0.1, float(sport_state_timeout_sec))),
+                "--standing-min-body-height",
+                str(max(0.01, float(standing_min_body_height))),
                 "--sdk-python-path",
                 str(sdk_python_path),
                 "--cyclonedds-python-path",
@@ -169,6 +194,8 @@ class MotionWorkerProxy:
                 "--noshm-library-fragment",
                 str(noshm_library_fragment),
             ]
+            if auto_prepare_posture:
+                command.append("--auto-prepare-posture")
             if require_noshm_runtime:
                 command.append("--require-noshm-runtime")
             process = popen_factory(
@@ -190,8 +217,49 @@ class MotionWorkerProxy:
                         str(ready.get("error", "unknown error"))[:512]
                     )
                 )
+            controller = ready.get("controller")
+            if controller not in ("mcf", "sport_mode"):
+                raise MotionProtocolError(
+                    "worker sent an invalid motion controller"
+                )
+            posture_prepared = ready.get("posture_prepared")
+            body_height = ready.get("body_height")
+            sport_mode = ready.get("sport_mode")
+            gait_type = ready.get("gait_type")
+            sport_error_code = ready.get("sport_error_code")
+            if not isinstance(posture_prepared, bool):
+                raise MotionProtocolError(
+                    "worker sent invalid posture-prepared status"
+                )
+            if (
+                isinstance(body_height, bool)
+                or not isinstance(body_height, (int, float))
+                or not math.isfinite(float(body_height))
+                or float(body_height) < 0.0
+            ):
+                raise MotionProtocolError("worker sent invalid body height")
+            for name, value in (
+                ("sport mode", sport_mode),
+                ("gait type", gait_type),
+                ("sport error code", sport_error_code),
+            ):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise MotionProtocolError(
+                        "worker sent invalid {}".format(name)
+                    )
             parent_peer.settimeout(max(0.05, float(rpc_timeout_sec)))
-            return cls(parent_peer, process, rpc_timeout_sec, reap_timeout_sec)
+            return cls(
+                parent_peer,
+                process,
+                rpc_timeout_sec,
+                reap_timeout_sec,
+                controller=controller,
+                posture_prepared=posture_prepared,
+                body_height=float(body_height),
+                sport_mode=sport_mode,
+                gait_type=gait_type,
+                sport_error_code=sport_error_code,
+            )
         except Exception as error:
             try:
                 child_peer.close()
@@ -210,6 +278,30 @@ class MotionWorkerProxy:
     @property
     def alive(self) -> bool:
         return self._peer is not None and self._process.poll() is None
+
+    @property
+    def controller(self) -> str:
+        return self._controller
+
+    @property
+    def posture_prepared(self) -> bool:
+        return self._posture_prepared
+
+    @property
+    def body_height(self) -> float:
+        return self._body_height
+
+    @property
+    def sport_mode(self) -> int:
+        return self._sport_mode
+
+    @property
+    def gait_type(self) -> int:
+        return self._gait_type
+
+    @property
+    def sport_error_code(self) -> int:
+        return self._sport_error_code
 
     def _request(self, method: str, arguments: Any) -> int:
         with self._lock:
