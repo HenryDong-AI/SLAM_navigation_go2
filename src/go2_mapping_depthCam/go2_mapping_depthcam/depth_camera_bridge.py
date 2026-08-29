@@ -1,4 +1,4 @@
-"""Capture a RealSense and publish synchronized ROS 2 images."""
+"""Capture RealSense frames and publish atomic XYZRGB clouds plus images."""
 
 import json
 import sys
@@ -15,8 +15,12 @@ from rclpy.qos import (
     QoSProfile,
     QoSReliabilityPolicy,
 )
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
 from std_msgs.msg import String
+
+from go2_mapping.pointcloud import xyzrgb_to_float32_bytes
+
+from .geometry import depth_to_camera_points_rgb
 
 
 class DepthCameraBridge(Node):
@@ -34,6 +38,8 @@ class DepthCameraBridge(Node):
         self._capture_errors = 0
         self._recovery_count = 0
         self._last_publish_duration_sec = 0.0
+        self._last_frame_processing_duration_sec = 0.0
+        self._last_cloud_point_count = 0
 
         self.serial_number = str(self._parameter("serial_number", "")).strip()
         self.width = int(self._parameter("width", 640))
@@ -76,6 +82,21 @@ class DepthCameraBridge(Node):
         self.status_topic = str(
             self._parameter("status_topic", "/go2/depth_camera/status")
         )
+        self.pointcloud_topic = str(
+            self._parameter("pointcloud_topic", "/go2/depth_camera/points")
+        )
+        self.pointcloud_pixel_stride = max(
+            1, int(self._parameter("pointcloud_pixel_stride", 2))
+        )
+        self.pointcloud_min_depth = float(
+            self._parameter("pointcloud_min_depth", 0.25)
+        )
+        self.pointcloud_max_depth = float(
+            self._parameter("pointcloud_max_depth", 3.0)
+        )
+        self.pointcloud_max_points = max(
+            1, int(self._parameter("pointcloud_max_points", 60000))
+        )
 
         if min(self.width, self.height, self.fps) <= 0:
             raise ValueError("camera dimensions and fps must be positive")
@@ -89,10 +110,21 @@ class DepthCameraBridge(Node):
             raise ValueError("camera recovery timing is invalid")
         if not self.frame_id:
             raise ValueError("frame_id must not be empty")
+        if (
+            self.pointcloud_min_depth <= 0.0
+            or self.pointcloud_max_depth <= self.pointcloud_min_depth
+        ):
+            raise ValueError("point-cloud depth bounds are invalid")
 
         sensor_qos = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=2,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+        cloud_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE,
         )
@@ -117,6 +149,9 @@ class DepthCameraBridge(Node):
         self._status_publisher = self.create_publisher(
             String, self.status_topic, status_qos
         )
+        self._pointcloud_publisher = self.create_publisher(
+            PointCloud2, self.pointcloud_topic, cloud_qos
+        )
 
         self._profile = self._start_pipeline()
         self._camera_info_template = self._make_camera_info(self._profile)
@@ -124,12 +159,13 @@ class DepthCameraBridge(Node):
         self._poll_timer = self.create_timer(0.005, self._poll_camera)
         self._status_timer = self.create_timer(1.0, self._publish_status)
         self.get_logger().info(
-            "direct D435i capture ready: serial=%s %dx%d@%d Hz"
+            "direct D435i capture ready: serial=%s %dx%d@%d Hz atomic_cloud=%s"
             % (
                 self._device_serial or "automatic",
                 self.width,
                 self.height,
                 self.fps,
+                self.pointcloud_topic,
             )
         )
 
@@ -287,26 +323,48 @@ class DepthCameraBridge(Node):
             color_frame = aligned.get_color_frame()
             if not depth_frame or not color_frame:
                 return
+            frame_processing_started = time.monotonic()
             color = np.asanyarray(color_frame.get_data())
             raw_depth = np.asanyarray(depth_frame.get_data())
             depth_metres = raw_depth.astype(np.float32) * self._depth_scale
 
+            intrinsics = self._camera_info_template.k
+            points_camera, colors_rgb = depth_to_camera_points_rgb(
+                depth_metres,
+                color,
+                float(intrinsics[0]),
+                float(intrinsics[4]),
+                float(intrinsics[2]),
+                float(intrinsics[5]),
+                pixel_stride=self.pointcloud_pixel_stride,
+                min_depth=self.pointcloud_min_depth,
+                max_depth=self.pointcloud_max_depth,
+                max_points=self.pointcloud_max_points,
+            )
+            cloud_message = self._point_cloud_message(
+                points_camera, colors_rgb
+            )
             color_message = self._image_message(color, "bgr8")
             depth_message = self._image_message(depth_metres, "32FC1")
-            # Stamp after both expensive NumPy-to-ROS copies. Publish depth
-            # first so the mapper sees a host-clock timestamp close to its
-            # actual DDS delivery time instead of waiting behind RGB.
+            # All geometry and color for mapping are now one atomic message.
+            # The viewer images retain the exact same capture timestamp but
+            # are no longer synchronized downstream by independent DDS queues.
             publish_started = time.monotonic()
             stamp = self.get_clock().now().to_msg()
-            for message in (color_message, depth_message):
+            for message in (cloud_message, color_message, depth_message):
                 message.header.stamp = stamp
                 message.header.frame_id = self.frame_id
+            self._pointcloud_publisher.publish(cloud_message)
             self._depth_publisher.publish(depth_message)
             self._depth_info_publisher.publish(self._camera_info(stamp))
             self._color_publisher.publish(color_message)
             self._color_info_publisher.publish(self._camera_info(stamp))
+            self._last_cloud_point_count = int(points_camera.shape[0])
             self._last_publish_duration_sec = (
                 time.monotonic() - publish_started
+            )
+            self._last_frame_processing_duration_sec = (
+                time.monotonic() - frame_processing_started
             )
             self._last_publish_monotonic = now_monotonic
             self._last_frame_monotonic = now_monotonic
@@ -371,6 +429,31 @@ class DepthCameraBridge(Node):
         message.data = payload
         return message
 
+    @staticmethod
+    def _point_cloud_message(points, colors_rgb) -> PointCloud2:
+        message = PointCloud2()
+        message.height = 1
+        message.width = int(points.shape[0])
+        message.fields = [
+            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(
+                name="rgb",
+                offset=12,
+                datatype=PointField.FLOAT32,
+                count=1,
+            ),
+        ]
+        message.is_bigendian = False
+        message.point_step = 16
+        message.row_step = message.point_step * message.width
+        message.is_dense = True
+        payload = array("B")
+        payload.frombytes(xyzrgb_to_float32_bytes(points, colors_rgb))
+        message.data = payload
+        return message
+
     def _publish_status(self) -> None:
         age: Optional[float]
         if self._last_frame_monotonic:
@@ -393,6 +476,12 @@ class DepthCameraBridge(Node):
             "capture_errors": self._capture_errors,
             "recovery_count": self._recovery_count,
             "publish_duration_sec": self._last_publish_duration_sec,
+            "frame_processing_duration_sec": (
+                self._last_frame_processing_duration_sec
+            ),
+            "atomic_pointcloud_topic": self.pointcloud_topic,
+            "atomic_pointcloud_points": self._last_cloud_point_count,
+            "pointcloud_pixel_stride": self.pointcloud_pixel_stride,
         }
         message = String()
         message.data = json.dumps(

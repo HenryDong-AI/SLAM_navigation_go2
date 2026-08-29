@@ -175,7 +175,32 @@ topics and Nav2 interfaces. Each aligned depth pixel is reconstructed in 3D,
 keeps the RGB value from the same pixel, and contributes to a weighted XYZ and
 RGB average in its world-frame voxel. `/go2/map/cloud` therefore contains
 `x`, `y`, `z`, and packed `rgb` fields. The RViz **3D Map** display uses those
-measured colors automatically. Its
+measured colors automatically. The D435i captures 848x480 at its native 15 Hz profile and publishes the
+newest bounded XYZRGB cloud at 5 Hz with `pointcloud_pixel_stride: 2`. The
+bridge places aligned XYZ and RGB from each capture into one atomic
+`/go2/depth_camera/points` message. Publisher and subscriber both use
+KEEP_LAST depth 1, and the mapper has one latest-only cloud mailbox. There are
+no independent RGB/depth queues or downstream timestamp pairing, so delayed
+callbacks cannot leave mismatched frames that permanently stop fusion.
+
+Full `/go2/map/cloud` serialization, occupancy publication, and 60-second
+autosave are request-coalesced on a separate output worker. Sensor/mailbox
+state and map/registration state also use separate locks, so growing-map output
+cannot block camera or odometry intake. Redundant display requests may be
+coalesced, but the newest complete input remains available to fusion. The final
+voxel size remains 0.04 m.
+
+Before a moving RGB-D scan enters the permanent map, bounded planar ICP aligns
+it to a five-frame local RGB-D submap. Corrections are accepted only with
+sufficient overlap and low RMSE and are limited to 0.10 m and 4 degrees. This
+registration is map-only: it never changes `/go2/odom`, `odom -> base_link`,
+Nav2, or the motion gate. It reduces local duplicate edges, but it is not a
+global pose graph or loop-closure system, so long trajectories can still drift.
+If ICP rejects a scan, its points still enter the permanent voxel map using the
+guarded Go2 odometry pose.
+After three consecutive registration failures, the mapper keeps the permanent
+map but reseeds its short local ICP target from the current odometry-positioned
+scan. This prevents a lost target from remaining permanently stale. Its
 `base_link <- d435i_color_optical_frame` transform was measured on this Go2
 by registering 30 stationary D435i/LiDAR pairs (4.38 cm nearest-surface RMSE,
 96.5% overlap). The result is stored in
@@ -224,8 +249,19 @@ ros2 topic echo -f /go2/depth_camera/status
 # It must report: "state":"streaming"
 
 ros2 topic echo -f /go2/mapping/status
-# It must report "state": "mapping", "rgb_fusion": true, and increasing
-# voxel_count and colorized_voxel_count values.
+# It must report "state": "mapping", input_type:
+# "atomic_xyzrgb_pointcloud2", and increasing frames_fused/voxel_count.
+# output.worker_alive must remain true. input_age_sec should normally stay
+# below max_camera_age_sec (0.50 s), even during slow map publication/autosave.
+# A rising publish_coalesced value means display serialization is slower than
+# its requested rate; fusion should still increase independently.
+# frames_superseded may rise by design when processing is slower than 5 Hz: it
+# means a complete older cloud was replaced by the newest complete cloud. While
+# moving, registration accepted or rejected should increase; rejected scans
+# still fuse via odometry.
+
+ros2 topic hz /go2/depth_camera/points
+# Expect approximately 5 Hz while the D435i status says streaming.
 
 ./scripts/enable_motion.sh --i-understand
 ```
@@ -259,6 +295,11 @@ source scripts/env.sh
 rviz2 -d src/go2_navigation/rviz/go2_navigation.rviz
 ```
 
+This configuration opens an uncluttered quality-check view with only **Grid**
+and the RGB **3D Map** enabled. The voxel cloud is rendered as 2-pixel points;
+the occupancy map, semantic cloud, costmaps, raw LiDAR, odometry trails, and
+robot model remain available in the Displays panel but start disabled.
+
 The default `./scripts/start_mapping.sh` command already runs this RViz
 configuration, so do not start a second copy unless the stack was launched with
 `use_rviz:=false` or RViz was closed.
@@ -275,12 +316,12 @@ rviz2 -d src/go2_navigation/rviz/go2_navigation.rviz
 ```
 
 If Qt reports `could not connect to display`, the SSH/desktop display is not
-available; reinstalling RViz or the `xcb` plugin is not the fix. In RViz, use
-`base_link` as the live-session fixed frame and enable these configured
-displays:
+available; reinstalling RViz or the `xcb` plugin is not the fix. Keep `odom`
+as the fixed frame for the fused map. For navigation debugging, manually
+re-enable any of these configured displays after checking the RGB map alone:
 
 - **3D Map**: `/go2/map/cloud`
-- **PointCloud**: `/go2/lidar/cloud_base`
+- **PointCloud2**: `/go2/lidar/cloud_base`
 - **Semantic 3D Map**: `/go2/semantic/cloud`
 - **Robot Odometry**: `/go2/odom`
 
@@ -377,7 +418,8 @@ continued processing.
 | `/go2/time_sync/status` | Sensor clock offset and stream health |
 | `/go2/map/cloud` | accumulated XYZRGB 3D voxel map (`rgb` is neutral gray for the LiDAR-only backend) |
 | `/go2/depth_camera/color/image_raw` | D435i RGB image (depth backend) |
-| `/go2/depth_camera/aligned_depth/image_raw` | aligned `32FC1` depth in metres |
+| `/go2/depth_camera/aligned_depth/image_raw` | aligned `32FC1` depth in metres (viewer/debug only) |
+| `/go2/depth_camera/points` | atomic camera-frame XYZRGB input used by the depth mapper |
 | `/map` | live 2D occupancy grid for Nav2 |
 | `/go2/semantic/cloud` | labeled/colorized semantic 3D voxels |
 | `/go2/semantic/markers` | class labels in RViz |

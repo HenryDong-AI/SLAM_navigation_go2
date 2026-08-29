@@ -124,6 +124,96 @@ def read_xyz(message, max_points: Optional[int] = None) -> np.ndarray:
     ).copy()
 
 
+def read_xyzrgb(message, max_points: Optional[int] = None):
+    # Decode XYZ and PCL-compatible packed 0x00RRGGBB from PointCloud2.
+    width = int(message.width)
+    height = int(message.height)
+    if width < 0 or height < 0:
+        raise PointCloudFormatError("width and height must not be negative")
+    count = width * height
+    if max_points is not None and count > int(max_points):
+        raise PointCloudFormatError(
+            "cloud declares {} points, above the configured limit {}".format(
+                count, int(max_points)
+            )
+        )
+    if count == 0:
+        return (
+            np.empty((0, 3), dtype=np.float64),
+            np.empty((0, 3), dtype=np.uint8),
+        )
+
+    by_name = {str(field.name): field for field in message.fields}
+    if "rgb" not in by_name:
+        raise PointCloudFormatError("missing PointCloud2 field: rgb")
+    rgb_field = by_name["rgb"]
+    if int(rgb_field.datatype) not in (6, 7):
+        raise PointCloudFormatError("rgb field must be UINT32 or FLOAT32")
+    if int(getattr(rgb_field, "count", 1)) != 1:
+        raise PointCloudFormatError("field rgb must be scalar")
+
+    xyz_dtype = _xyz_dtype(message)
+    point_step = int(message.point_step)
+    rgb_offset = int(rgb_field.offset)
+    if rgb_offset < 0 or rgb_offset + 4 > point_step:
+        raise PointCloudFormatError("field rgb extends beyond point_step")
+    byte_order = ">" if bool(message.is_bigendian) else "<"
+    dtype = np.dtype(
+        {
+            "names": ["x", "y", "z", "rgb"],
+            "formats": [
+                xyz_dtype.fields["x"][0],
+                xyz_dtype.fields["y"][0],
+                xyz_dtype.fields["z"][0],
+                byte_order + "u4",
+            ],
+            "offsets": [
+                xyz_dtype.fields["x"][1],
+                xyz_dtype.fields["y"][1],
+                xyz_dtype.fields["z"][1],
+                rgb_offset,
+            ],
+            "itemsize": point_step,
+        }
+    )
+    minimum_row_step = width * point_step
+    row_step = int(message.row_step)
+    if row_step < minimum_row_step:
+        raise PointCloudFormatError("row_step is smaller than width * point_step")
+    data = memoryview(message.data)
+    required_bytes = (height - 1) * row_step + minimum_row_step
+    if len(data) < required_bytes:
+        raise PointCloudFormatError(
+            "PointCloud2 data buffer is shorter than its declared layout"
+        )
+    if row_step == minimum_row_step:
+        records = np.frombuffer(data[:required_bytes], dtype=dtype, count=count)
+    else:
+        rows = []
+        for row_index in range(height):
+            begin = row_index * row_step
+            end = begin + minimum_row_step
+            rows.append(np.frombuffer(data[begin:end], dtype=dtype, count=width))
+        records = np.concatenate(rows)
+
+    points = np.column_stack(
+        (
+            records["x"].astype(np.float64, copy=False),
+            records["y"].astype(np.float64, copy=False),
+            records["z"].astype(np.float64, copy=False),
+        )
+    ).copy()
+    packed = records["rgb"].astype(np.uint32, copy=False)
+    colors = np.column_stack(
+        (
+            (packed >> 16) & 0xFF,
+            (packed >> 8) & 0xFF,
+            packed & 0xFF,
+        )
+    ).astype(np.uint8, copy=False)
+    return points, colors.copy()
+
+
 def xyz_to_float32_bytes(points: np.ndarray) -> bytes:
     """Encode an N-by-3 array in the conventional little-endian XYZ layout."""
 

@@ -12,6 +12,14 @@ from go2_mapping_depthcam.geometry import (
     rigid_transform,
     transform_points,
 )
+from go2_mapping_depthcam.registration import (
+    best_fit_planar_transform,
+    planar_rotation_degrees,
+    register_planar_scan,
+    scale_planar_transform,
+    transform_points_fast,
+    voxel_downsample,
+)
 
 
 class _DepthMessage:
@@ -106,6 +114,63 @@ class GeometryTest(unittest.TestCase):
     def test_rejects_non_rigid_transform(self):
         with self.assertRaises(ValueError):
             rigid_transform(np.diag([1.0, 1.0, 2.0, 1.0]).reshape(-1))
+
+    def test_planar_best_fit_does_not_change_height(self):
+        source = np.asarray(
+            [[0.0, 0.0, 0.1], [1.0, 0.0, 0.5], [0.0, 2.0, 0.9]]
+        )
+        yaw = np.deg2rad(10.0)
+        expected = np.eye(4)
+        expected[:2, :2] = [
+            [np.cos(yaw), -np.sin(yaw)],
+            [np.sin(yaw), np.cos(yaw)],
+        ]
+        expected[:2, 3] = [0.2, -0.1]
+        target = transform_points_fast(source, expected)
+        actual = best_fit_planar_transform(source, target)
+        np.testing.assert_allclose(actual, expected, atol=1.0e-10)
+
+    def test_planar_registration_recovers_small_scan_error(self):
+        rng = np.random.RandomState(7)
+        source = rng.uniform([-1.0, -0.8, 0.0], [1.1, 0.9, 1.5], (800, 3))
+        yaw = np.deg2rad(2.0)
+        expected = np.eye(4)
+        expected[:2, :2] = [
+            [np.cos(yaw), -np.sin(yaw)],
+            [np.sin(yaw), np.cos(yaw)],
+        ]
+        expected[:2, 3] = [0.03, -0.02]
+        target = transform_points_fast(source, expected)
+        actual, rmse, overlap, inliers = register_planar_scan(
+            source,
+            target,
+            max_correspondence=0.15,
+            max_iterations=12,
+            trim_fraction=0.8,
+            min_correspondences=100,
+        )
+        np.testing.assert_allclose(actual, expected, atol=2.0e-3)
+        self.assertLess(rmse, 0.005)
+        self.assertGreater(overlap, 0.98)
+        self.assertGreater(inliers, 780)
+
+    def test_registration_gain_and_downsample_cap(self):
+        transform = np.eye(4)
+        yaw = np.deg2rad(4.0)
+        transform[:2, :2] = [
+            [np.cos(yaw), -np.sin(yaw)],
+            [np.sin(yaw), np.cos(yaw)],
+        ]
+        transform[:2, 3] = [0.10, -0.04]
+        scaled = scale_planar_transform(transform, 0.5)
+        self.assertAlmostEqual(planar_rotation_degrees(scaled), 2.0)
+        np.testing.assert_allclose(scaled[:2, 3], [0.05, -0.02])
+
+        points = np.column_stack(
+            [np.arange(30, dtype=float), np.zeros(30), np.zeros(30)]
+        )
+        reduced = voxel_downsample(points, 0.5, max_points=7)
+        self.assertEqual(reduced.shape, (7, 3))
 
 
 if __name__ == "__main__":

@@ -3,12 +3,15 @@ depth_camera_bridge:
     # Leave empty to select the first RealSense. The installed D435i was
     # detected as serial 250122076106 during setup.
     serial_number: ""
-    # Maximum common native D435i depth/color resolution. Keep 15 FPS and the
-    # point cap below to bound alignment, DDS, and Python fusion load.
-    width: 1280
-    height: 720
+    # Intel's accuracy-oriented D435i profile. It delivered many more usable
+    # fused frames than 1280x720 on the Go2 while retaining native depth detail.
+    width: 848
+    height: 480
     fps: 15
-    publish_rate_hz: 15.0
+    # Capture at the native 15 Hz profile but publish only the newest frame at
+    # the mapper's 5 Hz processing rate. This avoids wasting DDS bandwidth on
+    # frames the mapper cannot fuse.
+    publish_rate_hz: 5.0
     # The D435i on this device can remain enumerated while its stream stalls.
     # Because this bridge exclusively owns it, reset only that USB camera and
     # restart capture when no frames arrive.
@@ -21,12 +24,17 @@ depth_camera_bridge:
     color_info_topic: /go2/depth_camera/color/camera_info
     depth_info_topic: /go2/depth_camera/aligned_depth/camera_info
     status_topic: /go2/depth_camera/status
+    # Atomic mapping input: aligned XYZ and RGB share one DDS sample, so a
+    # delayed executor can never retain mismatched image timestamps.
+    pointcloud_topic: /go2/depth_camera/points
+    pointcloud_pixel_stride: 2
+    pointcloud_min_depth: 0.25
+    pointcloud_max_depth: 3.0
+    pointcloud_max_points: 60000
 
 go2_mapping_depthcam:
   ros__parameters:
-    depth_topic: /go2/depth_camera/aligned_depth/image_raw
-    color_topic: /go2/depth_camera/color/image_raw
-    camera_info_topic: /go2/depth_camera/aligned_depth/camera_info
+    camera_cloud_topic: /go2/depth_camera/points
     odom_topic: /go2/odom
     time_sync_topic: /go2/time_sync/status
     map_cloud_topic: /go2/map/cloud
@@ -34,7 +42,7 @@ go2_mapping_depthcam:
     mapping_status_topic: /go2/mapping/status
     world_frame: odom
     base_frame: base_link
-    expected_depth_frame: d435i_color_optical_frame
+    expected_camera_frame: d435i_color_optical_frame
     time_sync_required: true
 
     # Measured on this Go2 by registering 30 stationary D435i depth/LiDAR
@@ -48,17 +56,40 @@ go2_mapping_depthcam:
        0.0, 0.0, 0.0, 1.0]
 
     processing_rate_hz: 5.0
-    # Reconstruct one pixel in four (stride 2 on both axes), then cap the
-    # accepted candidates so one frame cannot monopolize the executor.
-    pixel_stride: 2
-    min_depth: 0.25
-    max_depth: 3.0
-    max_points_per_frame: 60000
-    max_depth_age_sec: 0.50
+    # The bridge already bounds/deprojects each atomic cloud. This second cap
+    # rejects malformed or unexpectedly large external PointCloud2 samples.
+    max_camera_points: 60000
+    max_camera_age_sec: 0.50
     max_odom_delta_sec: 0.15
     odom_buffer_size: 100
-    rgb_pair_buffer_size: 4
 
+    # Correct moving depth scans against a short recent RGB-D submap before
+    # voxel fusion. This is deliberately map-only: /go2/odom, the robot TF,
+    # Nav2, and the motion gate are never modified by registration.
+    registration_enabled: true
+    registration_rate_hz: 2.0
+    registration_voxel_size: 0.06
+    registration_submap_frames: 5
+    registration_max_source_points: 5000
+    registration_max_target_points: 12000
+    registration_max_correspondence: 0.14
+    registration_iterations: 8
+    registration_trim_fraction: 0.75
+    registration_min_correspondences: 250
+    registration_min_overlap: 0.35
+    registration_max_rmse: 0.07
+    registration_max_translation: 0.10
+    registration_max_rotation_deg: 4.0
+    registration_gain: 0.60
+    registration_min_motion_translation: 0.015
+    registration_min_motion_rotation_deg: 0.50
+    # A rejected scan is fused with guarded Go2 odometry. After this many
+    # consecutive failures, replace only the short ICP target submap with the
+    # current scan so registration cannot remain locked to an old location.
+    registration_reseed_after_rejections: 3
+
+    # Keep the requested 4 cm final map grid. Registration, not smaller
+    # voxels, addresses duplicated/smeared object surfaces.
     voxel_size: 0.04
     min_point_range: 0.20
     max_point_range: 5.0
@@ -79,6 +110,8 @@ go2_mapping_depthcam:
     max_ray_cells: 4096
     max_dense_grid_cells: 4000000
 
+    # Timers only request work. Full-map serialization/publication and
+    # autosave are coalesced on a dedicated output worker.
     publish_rate_hz: 1.0
     output_directory: /home/unitree/SLAM_nav/maps_depth_camera
     load_state_path: ""
