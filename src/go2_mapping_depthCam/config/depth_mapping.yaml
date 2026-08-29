@@ -3,8 +3,10 @@ depth_camera_bridge:
     # Leave empty to select the first RealSense. The installed D435i was
     # detected as serial 250122076106 during setup.
     serial_number: ""
-    width: 640
-    height: 480
+    # Maximum common native D435i depth/color resolution. Keep 15 FPS and the
+    # point cap below to bound alignment, DDS, and Python fusion load.
+    width: 1280
+    height: 720
     fps: 15
     publish_rate_hz: 15.0
     # The D435i on this device can remain enumerated while its stream stalls.
@@ -23,6 +25,7 @@ depth_camera_bridge:
 go2_mapping_depthcam:
   ros__parameters:
     depth_topic: /go2/depth_camera/aligned_depth/image_raw
+    color_topic: /go2/depth_camera/color/image_raw
     camera_info_topic: /go2/depth_camera/aligned_depth/camera_info
     odom_topic: /go2/odom
     time_sync_topic: /go2/time_sync/status
@@ -45,20 +48,23 @@ go2_mapping_depthcam:
        0.0, 0.0, 0.0, 1.0]
 
     processing_rate_hz: 5.0
-    pixel_stride: 4
-    min_depth: 0.20
-    max_depth: 5.0
-    max_points_per_frame: 20000
+    # Reconstruct one pixel in four (stride 2 on both axes), then cap the
+    # accepted candidates so one frame cannot monopolize the executor.
+    pixel_stride: 2
+    min_depth: 0.25
+    max_depth: 3.0
+    max_points_per_frame: 60000
     max_depth_age_sec: 0.50
     max_odom_delta_sec: 0.15
     odom_buffer_size: 100
+    rgb_pair_buffer_size: 4
 
-    voxel_size: 0.08
+    voxel_size: 0.04
     min_point_range: 0.20
     max_point_range: 5.0
     min_relative_z: -0.50
     max_relative_z: 2.00
-    max_voxels: 300000
+    max_voxels: 600000
     retention_radius: 0.0
 
     grid_resolution: 0.10
@@ -85,4 +91,4 @@ rgbd_viewer:
     color_topic: /go2/depth_camera/color/image_raw
     depth_topic: /go2/depth_camera/aligned_depth/image_raw
     window_name: "Go2 D435i RGB | RGB-D"
-    max_visual_depth: 5.0
+    max_visual_depth: 3.0

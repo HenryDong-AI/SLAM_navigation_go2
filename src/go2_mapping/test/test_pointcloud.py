@@ -4,7 +4,11 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from go2_mapping.pointcloud import PointCloudFormatError, read_xyz
+from go2_mapping.pointcloud import (
+    PointCloudFormatError,
+    read_xyz,
+    xyzrgb_to_float32_bytes,
+)
 
 
 def field(name, offset, datatype=7):
@@ -12,6 +16,15 @@ def field(name, offset, datatype=7):
 
 
 class PointCloudParsingTest(unittest.TestCase):
+    def test_xyzrgb_encoder_uses_pcl_packed_rgb_layout(self):
+        encoded = xyzrgb_to_float32_bytes(
+            np.asarray([[1.0, 2.0, 3.0]]),
+            np.asarray([[12, 34, 56]], dtype=np.uint8),
+        )
+        x, y, z, packed = struct.unpack("<fffI", encoded)
+        self.assertEqual((x, y, z), (1.0, 2.0, 3.0))
+        self.assertEqual(packed, 0x000C2238)
+
     def test_organized_float_cloud_with_row_padding(self):
         first_row = struct.pack("<ffffff", 1, 2, 3, 4, 5, 6) + b"PAD!"
         second_row = struct.pack("<ffffff", 7, 8, 9, 10, 11, 12) + b"PAD!"

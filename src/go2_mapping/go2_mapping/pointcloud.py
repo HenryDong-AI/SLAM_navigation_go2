@@ -131,3 +131,38 @@ def xyz_to_float32_bytes(points: np.ndarray) -> bytes:
     if array.ndim != 2 or array.shape[1] != 3:
         raise ValueError("points must have shape (N, 3)")
     return np.ascontiguousarray(array, dtype="<f4").tobytes()
+
+
+def xyzrgb_to_float32_bytes(points: np.ndarray, colors_rgb: np.ndarray) -> bytes:
+    """Encode XYZ plus PCL-compatible packed RGB in a 16-byte point."""
+
+    xyz = np.asarray(points)
+    colors = np.asarray(colors_rgb)
+    if xyz.ndim != 2 or xyz.shape[1] != 3:
+        raise ValueError("points must have shape (N, 3)")
+    if colors.shape != xyz.shape:
+        raise ValueError("colors_rgb must have shape (N, 3)")
+    if not np.isfinite(xyz).all() or not np.isfinite(colors).all():
+        raise ValueError("XYZRGB values must be finite")
+    if (colors < 0).any() or (colors > 255).any():
+        raise ValueError("RGB channels must be in [0, 255]")
+    colors_u8 = np.rint(colors).astype(np.uint8)
+    packed_rgb = (
+        colors_u8[:, 0].astype(np.uint32) << 16
+        | colors_u8[:, 1].astype(np.uint32) << 8
+        | colors_u8[:, 2].astype(np.uint32)
+    )
+    dtype = np.dtype(
+        {
+            "names": ["x", "y", "z", "rgb"],
+            "formats": ["<f4", "<f4", "<f4", "<u4"],
+            "offsets": [0, 4, 8, 12],
+            "itemsize": 16,
+        }
+    )
+    records = np.empty(xyz.shape[0], dtype=dtype)
+    records["x"] = xyz[:, 0]
+    records["y"] = xyz[:, 1]
+    records["z"] = xyz[:, 2]
+    records["rgb"] = packed_rgb
+    return records.tobytes()

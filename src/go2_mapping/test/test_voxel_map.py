@@ -50,6 +50,22 @@ class VoxelAccumulatorTest(unittest.TestCase):
         restored.restore(state)
         np.testing.assert_allclose(restored.points(), accumulator.points())
 
+    def test_rgb_is_averaged_and_restored_with_geometry(self):
+        accumulator = make_map()
+        points = np.asarray([[0.02, 0.02, 0.02], [0.08, 0.08, 0.08]])
+        colors = np.asarray([[255, 0, 0], [0, 0, 255]], dtype=np.uint8)
+        accumulator.fuse_filtered(points, [0, 0, 0], 10, colors)
+        xyz, rgb = accumulator.points_with_colors()
+        np.testing.assert_allclose(xyz, [[0.05, 0.05, 0.05]])
+        np.testing.assert_array_equal(rgb, [[128, 0, 128]])
+        state = accumulator.state()
+        self.assertIn("voxel_colors", state)
+        restored = make_map()
+        restored.restore(state)
+        restored_xyz, restored_rgb = restored.points_with_colors()
+        np.testing.assert_allclose(restored_xyz, xyz)
+        np.testing.assert_array_equal(restored_rgb, rgb)
+
     def test_world_origin_padding_is_rejected_after_robot_moves(self):
         accumulator = make_map()
         accepted = accumulator.fuse(

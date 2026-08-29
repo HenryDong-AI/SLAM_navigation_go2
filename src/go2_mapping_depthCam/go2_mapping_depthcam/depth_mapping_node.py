@@ -7,7 +7,7 @@ import os
 import threading
 import time
 from array import array
-from collections import deque
+from collections import OrderedDict, deque
 
 import numpy as np
 import rclpy
@@ -24,12 +24,17 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
 from go2_mapping.grid_map import LogOddsGrid
-from go2_mapping.pointcloud import xyz_to_float32_bytes
+from go2_mapping.pointcloud import xyzrgb_to_float32_bytes
 from go2_mapping.state_io import load_snapshot, save_snapshot
 from go2_mapping.time_sync_guard import TimeSyncStatusGuard
 from go2_mapping.voxel_map import VoxelAccumulator
 
-from .geometry import decode_depth_image, depth_to_camera_points, pose_matrix
+from .geometry import (
+    decode_color_image,
+    decode_depth_image,
+    depth_to_camera_points_rgb,
+    pose_matrix,
+)
 from .geometry import rigid_transform, transform_points
 
 
@@ -49,6 +54,9 @@ class DepthMappingNode(Node):
 
         self._depth_topic = self._param(
             "depth_topic", "/go2/depth_camera/aligned_depth/image_raw"
+        )
+        self._color_topic = self._param(
+            "color_topic", "/go2/depth_camera/color/image_raw"
         )
         self._camera_info_topic = self._param(
             "camera_info_topic", "/go2/depth_camera/aligned_depth/camera_info"
@@ -108,6 +116,11 @@ class DepthMappingNode(Node):
         self._max_odom_delta = float(self._param("max_odom_delta_sec", 0.15))
         odom_buffer_size = max(2, int(self._param("odom_buffer_size", 100)))
         self._odom_buffer = deque(maxlen=odom_buffer_size)
+        self._pair_buffer_size = max(
+            2, int(self._param("rgb_pair_buffer_size", 4))
+        )
+        self._pending_depth = OrderedDict()
+        self._pending_color = OrderedDict()
 
         self._voxel_size = float(self._param("voxel_size", 0.08))
         self._min_point_range = float(self._param("min_point_range", 0.20))
@@ -200,6 +213,9 @@ class DepthMappingNode(Node):
         self._depth_sub = self.create_subscription(
             Image, self._depth_topic, self._on_depth, sensor_qos
         )
+        self._color_sub = self.create_subscription(
+            Image, self._color_topic, self._on_color, sensor_qos
+        )
         self._info_sub = self.create_subscription(
             CameraInfo, self._camera_info_topic, self._on_camera_info, sensor_qos
         )
@@ -235,8 +251,13 @@ class DepthMappingNode(Node):
             )
 
         self.get_logger().info(
-            "D435i mapper configured: depth=%s odom=%s output=%s"
-            % (self._depth_topic, self._odom_topic, self._output_directory)
+            "D435i RGB-D mapper configured: color=%s depth=%s odom=%s output=%s"
+            % (
+                self._color_topic,
+                self._depth_topic,
+                self._odom_topic,
+                self._output_directory,
+            )
         )
         if not self._extrinsics_confirmed:
             self.get_logger().error(
@@ -328,6 +349,8 @@ class DepthMappingNode(Node):
                 self._voxels.clear()
                 self._grid.clear()
                 self._odom_buffer.clear()
+                self._pending_depth.clear()
+                self._pending_color.clear()
                 self._last_depth_stamp_ns = -1
                 self._last_error = self._time_guard.fault_reason
         if became_faulted:
@@ -347,6 +370,29 @@ class DepthMappingNode(Node):
 
     def _on_depth(self, message):
         self._frames_received += 1
+        stamp_ns = _stamp_ns(message)
+        with self._lock:
+            color_message = self._pending_color.pop(stamp_ns, None)
+            if color_message is None:
+                self._pending_depth[stamp_ns] = message
+                while len(self._pending_depth) > self._pair_buffer_size:
+                    self._pending_depth.popitem(last=False)
+                    self._frames_dropped += 1
+                return
+        self._process_rgbd(message, color_message)
+
+    def _on_color(self, message):
+        stamp_ns = _stamp_ns(message)
+        with self._lock:
+            depth_message = self._pending_depth.pop(stamp_ns, None)
+            if depth_message is None:
+                self._pending_color[stamp_ns] = message
+                while len(self._pending_color) > self._pair_buffer_size:
+                    self._pending_color.popitem(last=False)
+                return
+        self._process_rgbd(depth_message, message)
+
+    def _process_rgbd(self, message, color_message):
         if not self._extrinsics_confirmed:
             self._frames_dropped += 1
             return
@@ -415,11 +461,32 @@ class DepthMappingNode(Node):
                 "image_size", "depth Image and CameraInfo dimensions differ"
             )
             return
+        if (
+            color_message.header.frame_id != message.header.frame_id
+            or _stamp_ns(color_message) != stamp_ns
+        ):
+            self._frames_dropped += 1
+            self._warn_throttled(
+                "rgb_pair_stamp",
+                "aligned RGB and depth frame IDs or timestamps differ",
+            )
+            return
+        if (
+            int(color_message.width) != int(message.width)
+            or int(color_message.height) != int(message.height)
+        ):
+            self._frames_dropped += 1
+            self._warn_throttled(
+                "rgb_pair_size", "aligned RGB and depth image sizes differ"
+            )
+            return
 
         try:
             depth = decode_depth_image(message)
-            points_camera = depth_to_camera_points(
+            color_bgr = decode_color_image(color_message)
+            points_camera, colors_rgb = depth_to_camera_points_rgb(
                 depth,
+                color_bgr,
                 camera_info["fx"],
                 camera_info["fy"],
                 camera_info["cx"],
@@ -432,7 +499,7 @@ class DepthMappingNode(Node):
         except ValueError as exc:
             self._frames_dropped += 1
             self._last_error = str(exc)
-            self._warn_throttled("depth_decode", "invalid depth image: %s" % exc)
+            self._warn_throttled("rgbd_decode", "invalid RGB-D pair: %s" % exc)
             return
         if points_camera.shape[0] == 0:
             self._frames_dropped += 1
@@ -441,13 +508,19 @@ class DepthMappingNode(Node):
         odom_from_camera = odom_from_base @ self._base_from_camera
         points_world = transform_points(points_camera, odom_from_camera)
         robot_position = odom_from_base[:3, 3]
-        accepted = self._voxels.filter_points(points_world, robot_position)
+        accepted_mask = self._voxels.filter_mask(
+            points_world, robot_position
+        )
+        accepted = points_world[accepted_mask]
+        accepted_colors = colors_rgb[accepted_mask]
         if accepted.shape[0] == 0:
             self._frames_dropped += 1
             return
 
         with self._lock:
-            self._voxels.fuse_filtered(accepted, robot_position, stamp_ns)
+            self._voxels.fuse_filtered(
+                accepted, robot_position, stamp_ns, accepted_colors
+            )
             self._grid.update(accepted, robot_position, stamp_ns)
             self._last_depth_stamp_ns = stamp_ns
             self._last_sensor_stamp_ns = stamp_ns
@@ -455,7 +528,7 @@ class DepthMappingNode(Node):
             self._last_error = ""
         self._last_process_monotonic = now_mono
 
-    def _point_cloud_message(self, points, stamp_ns):
+    def _point_cloud_message(self, points, colors_rgb, stamp_ns):
         message = PointCloud2()
         message.header.frame_id = self._world_frame
         message.header.stamp.sec = int(stamp_ns // 1_000_000_000)
@@ -466,13 +539,19 @@ class DepthMappingNode(Node):
             PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
             PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
             PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(
+                name="rgb",
+                offset=12,
+                datatype=PointField.FLOAT32,
+                count=1,
+            ),
         ]
         message.is_bigendian = False
-        message.point_step = 12
-        message.row_step = 12 * message.width
+        message.point_step = 16
+        message.row_step = 16 * message.width
         message.is_dense = True
         payload = array("B")
-        payload.frombytes(xyz_to_float32_bytes(points))
+        payload.frombytes(xyzrgb_to_float32_bytes(points, colors_rgb))
         message.data = payload
         return message
 
@@ -499,10 +578,12 @@ class DepthMappingNode(Node):
     def _publish_maps(self):
         with self._lock:
             stamp_ns = self._last_sensor_stamp_ns or self.get_clock().now().nanoseconds
-            points = self._voxels.points()
+            points, colors_rgb = self._voxels.points_with_colors()
             occupancy = self._occupancy_message(stamp_ns)
         if points.shape[0] > 0:
-            self._cloud_pub.publish(self._point_cloud_message(points, stamp_ns))
+            self._cloud_pub.publish(
+                self._point_cloud_message(points, colors_rgb, stamp_ns)
+            )
         if occupancy is not None:
             self._grid_pub.publish(occupancy)
 
@@ -539,6 +620,10 @@ class DepthMappingNode(Node):
                 "frames_fused": self._frames_fused,
                 "frames_dropped": self._frames_dropped,
                 "voxel_count": len(self._voxels),
+                "colorized_voxel_count": self._voxels.colorized_count(),
+                "rgb_fusion": True,
+                "pending_depth_frames": len(self._pending_depth),
+                "pending_color_frames": len(self._pending_color),
                 "grid_cell_count": len(self._grid),
                 "last_error": self._last_error,
                 "output_directory": self._output_directory,
@@ -550,7 +635,8 @@ class DepthMappingNode(Node):
     def _snapshot_metadata(self):
         return {
             "producer": "go2_mapping_depthcam",
-            "source": "Intel RealSense aligned depth",
+            "source": "Intel RealSense aligned RGB-D",
+            "has_rgb": True,
             "world_frame": self._world_frame,
             "base_frame": self._base_frame,
             "depth_frame": self._expected_depth_frame,
@@ -628,6 +714,8 @@ class DepthMappingNode(Node):
         with self._lock:
             self._voxels.clear()
             self._grid.clear()
+            self._pending_depth.clear()
+            self._pending_color.clear()
             self._last_sensor_stamp_ns = 0
             self._frames_fused = 0
         response.success = True

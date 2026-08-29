@@ -107,6 +107,62 @@ def depth_to_camera_points(
     return points
 
 
+def depth_to_camera_points_rgb(
+    depth_metres: np.ndarray,
+    color_bgr: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    pixel_stride: int,
+    min_depth: float,
+    max_depth: float,
+    max_points: int,
+):
+    """Deproject aligned depth and retain the matching RGB pixel values."""
+
+    depth = np.asarray(depth_metres, dtype=np.float32)
+    color = np.asarray(color_bgr)
+    if depth.ndim != 2 or depth.size == 0:
+        raise ValueError("depth image must be a non-empty 2D array")
+    if color.shape != depth.shape + (3,) or color.dtype != np.uint8:
+        raise ValueError("color image must be uint8 BGR matching depth size")
+    if not all(np.isfinite(value) and value > 0.0 for value in (fx, fy)):
+        raise ValueError("camera focal lengths must be finite and positive")
+    if not all(np.isfinite(value) for value in (cx, cy)):
+        raise ValueError("camera principal point must be finite")
+    if pixel_stride <= 0 or max_points <= 0:
+        raise ValueError("sampling limits must be positive")
+    if min_depth <= 0.0 or max_depth <= min_depth:
+        raise ValueError("depth bounds are invalid")
+
+    rows = np.arange(0, depth.shape[0], int(pixel_stride), dtype=np.int32)
+    cols = np.arange(0, depth.shape[1], int(pixel_stride), dtype=np.int32)
+    sampled_depth = depth[np.ix_(rows, cols)]
+    sampled_bgr = color[np.ix_(rows, cols)]
+    uu, vv = np.meshgrid(cols.astype(np.float32), rows.astype(np.float32))
+    valid = np.isfinite(sampled_depth)
+    finite_depth = np.where(valid, sampled_depth, 0.0)
+    valid &= finite_depth >= float(min_depth)
+    valid &= finite_depth <= float(max_depth)
+    if not valid.any():
+        return (
+            np.empty((0, 3), dtype=np.float64),
+            np.empty((0, 3), dtype=np.uint8),
+        )
+
+    z = sampled_depth[valid].astype(np.float64)
+    u = uu[valid].astype(np.float64)
+    v = vv[valid].astype(np.float64)
+    points = np.column_stack(((u - cx) * z / fx, (v - cy) * z / fy, z))
+    colors_rgb = sampled_bgr[valid][:, ::-1].copy()
+    if points.shape[0] > max_points:
+        stride = int(np.ceil(points.shape[0] / float(max_points)))
+        points = points[::stride][:max_points]
+        colors_rgb = colors_rgb[::stride][:max_points]
+    return points, colors_rgb
+
+
 def decode_depth_image(message, raw_depth_scale: float = 0.001) -> np.ndarray:
     """Decode a ROS Image-like depth message into float32 metres."""
     width = int(message.width)

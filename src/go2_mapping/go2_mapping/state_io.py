@@ -25,10 +25,27 @@ def _sync_file(path: Path) -> None:
         os.fsync(stream.fileno())
 
 
-def _write_binary_ply(path: Path, points: np.ndarray) -> None:
+def _write_binary_ply(
+    path: Path, points: np.ndarray, colors_rgb: np.ndarray = None
+) -> None:
     xyz = np.ascontiguousarray(points, dtype="<f4")
     if xyz.ndim != 2 or xyz.shape[1] != 3 or not np.isfinite(xyz).all():
         raise ValueError("PLY points must be a finite N-by-3 array")
+    colors = None
+    if colors_rgb is not None:
+        colors = np.asarray(colors_rgb)
+        if colors.shape != xyz.shape or not np.isfinite(colors).all():
+            raise ValueError("PLY colors must be a finite N-by-3 array")
+        if (colors < 0).any() or (colors > 255).any():
+            raise ValueError("PLY colors must be in [0, 255]")
+        colors = np.rint(colors).astype(np.uint8)
+    color_header = (
+        "property uchar red\n"
+        "property uchar green\n"
+        "property uchar blue\n"
+        if colors is not None
+        else ""
+    )
     header = (
         "ply\n"
         "format binary_little_endian 1.0\n"
@@ -37,11 +54,32 @@ def _write_binary_ply(path: Path, points: np.ndarray) -> None:
         "property float x\n"
         "property float y\n"
         "property float z\n"
+        "{}"
         "end_header\n"
-    ).format(xyz.shape[0])
+    ).format(xyz.shape[0], color_header)
     with path.open("wb") as stream:
         stream.write(header.encode("ascii"))
-        stream.write(xyz.tobytes())
+        if colors is None:
+            stream.write(xyz.tobytes())
+        else:
+            records = np.empty(
+                xyz.shape[0],
+                dtype=[
+                    ("x", "<f4"),
+                    ("y", "<f4"),
+                    ("z", "<f4"),
+                    ("red", "u1"),
+                    ("green", "u1"),
+                    ("blue", "u1"),
+                ],
+            )
+            records["x"] = xyz[:, 0]
+            records["y"] = xyz[:, 1]
+            records["z"] = xyz[:, 2]
+            records["red"] = colors[:, 0]
+            records["green"] = colors[:, 1]
+            records["blue"] = colors[:, 2]
+            stream.write(records.tobytes())
         stream.flush()
         os.fsync(stream.fileno())
 
@@ -97,7 +135,11 @@ def save_snapshot(
     final_dir = root / ("go2_map_" + stamp)
     temporary_dir = Path(tempfile.mkdtemp(prefix=".go2_map_tmp_", dir=str(root)))
     try:
-        _write_binary_ply(temporary_dir / "map.ply", voxel_state["voxel_centroids"])
+        _write_binary_ply(
+            temporary_dir / "map.ply",
+            voxel_state["voxel_centroids"],
+            voxel_state.get("voxel_colors"),
+        )
         pgm = occupancy_to_pgm(
             occupancy,
             free_threshold=free_threshold,
@@ -173,13 +215,14 @@ def load_snapshot(path: str) -> Tuple[Dict[str, np.ndarray], Dict[str, object]]:
         "grid_last_robot_cell",
         "metadata_json",
     }
+    optional = {"voxel_colors", "voxel_color_counts"}
     with np.load(str(state_path), allow_pickle=False) as archive:
         missing = required.difference(archive.files)
         if missing:
             raise ValueError("state file is missing: " + ", ".join(sorted(missing)))
         arrays = {
             key: np.asarray(archive[key]).copy()
-            for key in required
+            for key in required.union(optional.intersection(archive.files))
             if key != "metadata_json"
         }
         raw_metadata = archive["metadata_json"]

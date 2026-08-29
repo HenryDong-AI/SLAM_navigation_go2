@@ -171,7 +171,11 @@ The LiDAR mapper remains the default. Select exactly one geometric map backend:
 ```
 
 The depth-camera backend bypasses `go2_mapping_node` but keeps its public map
-topics and Nav2 interfaces. Its
+topics and Nav2 interfaces. Each aligned depth pixel is reconstructed in 3D,
+keeps the RGB value from the same pixel, and contributes to a weighted XYZ and
+RGB average in its world-frame voxel. `/go2/map/cloud` therefore contains
+`x`, `y`, `z`, and packed `rgb` fields. The RViz **3D Map** display uses those
+measured colors automatically. Its
 `base_link <- d435i_color_optical_frame` transform was measured on this Go2
 by registering 30 stationary D435i/LiDAR pairs (4.38 cm nearest-surface RMSE,
 96.5% overlap). The result is stored in
@@ -220,7 +224,8 @@ ros2 topic echo -f /go2/depth_camera/status
 # It must report: "state":"streaming"
 
 ros2 topic echo -f /go2/mapping/status
-# It must report: "state": "mapping" and an increasing voxel_count
+# It must report "state": "mapping", "rgb_fusion": true, and increasing
+# voxel_count and colorized_voxel_count values.
 
 ./scripts/enable_motion.sh --i-understand
 ```
@@ -370,7 +375,7 @@ continued processing.
 | `/go2/camera/image_raw`, `/go2/camera/image_raw/compressed`, `/go2/camera/image_rect`, `/go2/camera/camera_info` | Built-in front camera bridge |
 | `/go2/odom`, `/go2/lidar/cloud_base`, `/go2/lidar/cloud_deskewed` | Host-clock-normalized Go2 sensors |
 | `/go2/time_sync/status` | Sensor clock offset and stream health |
-| `/go2/map/cloud` | accumulated geometric 3D voxel map |
+| `/go2/map/cloud` | accumulated XYZRGB 3D voxel map (`rgb` is neutral gray for the LiDAR-only backend) |
 | `/go2/depth_camera/color/image_raw` | D435i RGB image (depth backend) |
 | `/go2/depth_camera/aligned_depth/image_raw` | aligned `32FC1` depth in metres |
 | `/map` | live 2D occupancy grid for Nav2 |

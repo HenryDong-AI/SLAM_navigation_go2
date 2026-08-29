@@ -22,7 +22,11 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
 from .grid_map import LogOddsGrid
-from .pointcloud import PointCloudFormatError, read_xyz, xyz_to_float32_bytes
+from .pointcloud import (
+    PointCloudFormatError,
+    read_xyz,
+    xyzrgb_to_float32_bytes,
+)
 from .state_io import load_snapshot, save_snapshot
 from .time_sync_guard import TimeSyncStatusGuard
 from .voxel_map import VoxelAccumulator
@@ -401,6 +405,11 @@ class MappingNode(Node):
     def _publish_map_cloud(self) -> None:
         with self._lock:
             points = self._voxels.points()
+        # Keep the public map-cloud schema identical for both mapping backends.
+        # The RGB-D backend publishes fused camera colors; the LiDAR-only
+        # backend has no color sensor correspondence, so it publishes neutral
+        # gray while retaining the standard packed PCL ``rgb`` field.
+        colors_rgb = np.full(points.shape, 180, dtype=np.uint8)
         now = self.get_clock().now().to_msg()
         message = PointCloud2()
         message.header.stamp = now
@@ -411,12 +420,18 @@ class MappingNode(Node):
             PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
             PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
             PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(
+                name="rgb",
+                offset=12,
+                datatype=PointField.FLOAT32,
+                count=1,
+            ),
         ]
         message.is_bigendian = False
-        message.point_step = 12
+        message.point_step = 16
         message.row_step = message.point_step * message.width
         payload = array("B")
-        payload.frombytes(xyz_to_float32_bytes(points))
+        payload.frombytes(xyzrgb_to_float32_bytes(points, colors_rgb))
         message.data = payload
         message.is_dense = True
         self._cloud_publisher.publish(message)

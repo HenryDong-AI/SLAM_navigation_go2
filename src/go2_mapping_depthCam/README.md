@@ -5,18 +5,20 @@ package name is lowercase, `go2_mapping_depthcam`, to follow ROS naming rules.
 
 This backend opens the Intel RealSense D435i directly with `pyrealsense2`; it
 does not require `realsense2_camera`. It publishes registered RGB and metric
-depth ROS messages, reconstructs a sampled point cloud, transforms it through
-the Go2 odometry pose, and produces the same public map interfaces as the LiDAR
-mapper:
+depth ROS messages, reconstructs aligned XYZRGB points, transforms XYZ through
+the Go2 odometry pose, and fuses both geometry and color in each world-frame
+voxel. It produces the same public map interfaces as the LiDAR mapper:
 
-- `/go2/map/cloud` -- fused voxel `PointCloud2`
+- `/go2/map/cloud` -- fused voxel `PointCloud2` with `x`, `y`, `z`, and packed
+  `rgb` fields; RViz's **3D Map** display shows the measured camera colors
 - `/map` -- 2D occupancy projection used by Nav2
 - `/go2/mapping/status` -- mapper status JSON
 - `/go2/map/save` and `/go2/map/reset` -- map services
 
 Atomic map snapshots are written below
-`/home/unitree/SLAM_nav/maps_depth_camera`. Each snapshot contains `map.ply`,
-`map.pgm`, `map.yaml`, and `state.npz`.
+`/home/unitree/SLAM_nav/maps_depth_camera`. Each snapshot contains a colored
+`map.ply`, the Nav2 `map.pgm` and `map.yaml`, and a resumable `state.npz` whose
+`voxel_colors` and `voxel_color_counts` arrays preserve RGB fusion state.
 
 ## Mount calibration
 

@@ -63,10 +63,10 @@ Visualization Manager:
         Min Value: 9999
         Value: true
       Axis: Z
-      Channel Name: intensity
+      Channel Name: rgb
       Class: rviz_default_plugins/PointCloud2
       Color: 210; 210; 210
-      Color Transformer: AxisColor
+      Color Transformer: RGB8
       Decay Time: 0
       Enabled: true
       Invert Rainbow: false
@@ -78,7 +78,7 @@ Visualization Manager:
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 2
-      Size (m): 0.07999999821186066
+      Size (m): 0.03999999910593033
       Style: Boxes
       Topic:
         Depth: 5
@@ -87,7 +87,7 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /go2/map/cloud
       Use Fixed Frame: true
-      Use rainbow: true
+      Use rainbow: false
       Value: true
     - Alpha: 0.949999988079071
       Autocompute Intensity Bounds: false

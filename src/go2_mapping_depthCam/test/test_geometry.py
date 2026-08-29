@@ -7,6 +7,7 @@ from go2_mapping_depthcam.geometry import (
     decode_color_image,
     decode_depth_image,
     depth_to_camera_points,
+    depth_to_camera_points_rgb,
     pose_matrix,
     rigid_transform,
     transform_points,
@@ -63,6 +64,30 @@ class GeometryTest(unittest.TestCase):
             max_points=10,
         )
         np.testing.assert_allclose(points, [[0.0, 0.0, 1.0], [2.0, 0.0, 2.0]])
+
+    def test_depth_deprojection_keeps_aligned_rgb(self):
+        depth = np.asarray([[1.0, 0.0], [2.0, 3.0]], dtype=np.float32)
+        bgr = np.asarray(
+            [
+                [[30, 20, 10], [0, 0, 0]],
+                [[60, 50, 40], [90, 80, 70]],
+            ],
+            dtype=np.uint8,
+        )
+        points, rgb = depth_to_camera_points_rgb(
+            depth,
+            bgr,
+            fx=1.0,
+            fy=1.0,
+            cx=0.0,
+            cy=0.0,
+            pixel_stride=1,
+            min_depth=0.1,
+            max_depth=2.5,
+            max_points=10,
+        )
+        np.testing.assert_allclose(points, [[0, 0, 1], [0, 2, 2]])
+        np.testing.assert_array_equal(rgb, [[10, 20, 30], [40, 50, 60]])
 
     def test_optical_to_base_and_odom_pose(self):
         base_from_optical = rigid_transform(

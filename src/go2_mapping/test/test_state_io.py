@@ -32,6 +32,8 @@ class StateIoTest(unittest.TestCase):
             "voxel_centroids": np.asarray([[0.1, 0.2, 0.3]], dtype=np.float64),
             "voxel_counts": np.asarray([2], dtype=np.int64),
             "voxel_last_seen_ns": np.asarray([10], dtype=np.int64),
+            "voxel_colors": np.asarray([[12, 34, 56]], dtype=np.float64),
+            "voxel_color_counts": np.asarray([2], dtype=np.int64),
         }
         grid_state = {
             "grid_keys": np.asarray([[0, 0]], dtype=np.int64),
@@ -63,6 +65,11 @@ class StateIoTest(unittest.TestCase):
             )
             arrays, metadata = load_snapshot(str(destination))
             np.testing.assert_array_equal(arrays["voxel_counts"], [2])
+            np.testing.assert_array_equal(
+                arrays["voxel_colors"], [[12, 34, 56]]
+            )
+            ply = (destination / "map.ply").read_bytes()
+            self.assertIn(b"property uchar red\n", ply)
             self.assertEqual(metadata["world_frame"], "odom")
             self.assertEqual(metadata["schema_version"], 1)
 
