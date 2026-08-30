@@ -45,6 +45,9 @@ class RegistrationRecoveryTest(unittest.TestCase):
         node._registration_min_motion_translation = 0.015
         node._registration_min_motion_rotation_deg = 0.50
         node._registration_reseed_after_rejections = 3
+        node._registration_normal_neighbours = 12
+        node._registration_huber_delta = 0.03
+        node._registration_damping = 1.0e-5
         node._registration_submap = deque(
             [points.copy()], maxlen=node._registration_submap_frames
         )
@@ -72,16 +75,17 @@ class RegistrationRecoveryTest(unittest.TestCase):
         node = self._node(points)
 
         with mock.patch(
-            "go2_mapping_depthcam.depth_mapping_node.register_planar_scan",
+            "go2_mapping_depthcam.depth_mapping_node.register_rigid_scan",
             side_effect=ValueError("too little scan-to-submap overlap"),
         ):
             for index in range(1, 4):
                 node._last_registration_monotonic = 0.0
                 odom_positioned = points + [0.1 * index, 0.0, 0.0]
-                fused_points, update_submap = node._maybe_register(
+                fused_points, update_submap, fusion_allowed = node._maybe_register(
                     odom_positioned, _pose(0.1 * index)
                 )
                 self.assertFalse(update_submap)
+                self.assertFalse(fusion_allowed)
                 np.testing.assert_allclose(fused_points, odom_positioned)
 
         self.assertEqual(node._registration_rejected, 3)

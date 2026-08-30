@@ -119,6 +119,15 @@ class NearestIndex:
         distances = np.sqrt(np.maximum(squared_distances[:, 0], 0.0))
         return distances, indices[:, 0]
 
+    def query_k(self, points, neighbours):
+        query = np.ascontiguousarray(points, dtype=np.float32)
+        count = min(max(1, int(neighbours)), self.points.shape[0])
+        indices, squared_distances = self.index.knnSearch(
+            query, count, params={"checks": 64}
+        )
+        distances = np.sqrt(np.maximum(squared_distances, 0.0))
+        return distances, indices
+
 
 def register_planar_scan(
     source,
@@ -179,6 +188,212 @@ def register_planar_scan(
     moved = transform_points_fast(source, total)
     distances, _ = tree.query(moved)
     inliers = np.isfinite(distances) & (distances < max_correspondence)
+    inlier_count = int(inliers.sum())
+    overlap = float(inlier_count) / float(source.shape[0])
+    rmse = (
+        float(np.sqrt(np.mean(np.square(distances[inliers]))))
+        if inlier_count
+        else float("inf")
+    )
+    return total, rmse, overlap, inlier_count
+
+
+def best_fit_rigid_transform(source, target):
+    """Estimate the full SE(3) transform mapping paired source to target."""
+
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    invalid = source.ndim != 2 or source.shape[1:] != (3,)
+    if invalid or source.shape != target.shape or source.shape[0] < 3:
+        raise ValueError("paired point arrays must both have shape (N, 3)")
+    source_mean = source.mean(axis=0)
+    target_mean = target.mean(axis=0)
+    covariance = (source - source_mean).T @ (target - target_mean)
+    u, _, vt = np.linalg.svd(covariance)
+    rotation = vt.T @ u.T
+    if np.linalg.det(rotation) < 0.0:
+        vt[-1, :] *= -1.0
+        rotation = vt.T @ u.T
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = rotation
+    transform[:3, 3] = target_mean - rotation @ source_mean
+    return transform
+
+
+def rotation_degrees(transform):
+    """Return the magnitude of a full 3D rotation."""
+
+    rotation = np.asarray(transform, dtype=np.float64)[:3, :3]
+    cosine = (float(np.trace(rotation)) - 1.0) * 0.5
+    return math.degrees(math.acos(min(1.0, max(-1.0, cosine))))
+
+
+def scale_rigid_transform(transform, gain):
+    """Scale an SE(3) correction without reducing it to a planar transform."""
+
+    gain = float(gain)
+    if not math.isfinite(gain) or gain <= 0.0 or gain > 1.0:
+        raise ValueError("registration gain must be in (0, 1]")
+    matrix = np.asarray(transform, dtype=np.float64)
+    rotation_vector, _ = cv2.Rodrigues(matrix[:3, :3])
+    rotation, _ = cv2.Rodrigues(rotation_vector * gain)
+    result = np.eye(4, dtype=np.float64)
+    result[:3, :3] = rotation
+    result[:3, 3] = matrix[:3, 3] * gain
+    return result
+
+
+def estimate_normals(points, neighbours=12, max_curvature=0.20):
+    """Estimate local PCA normals and reject non-surface neighbourhoods."""
+
+    cloud = np.asarray(points, dtype=np.float64)
+    if cloud.ndim != 2 or cloud.shape[1:] != (3,) or cloud.shape[0] < 4:
+        raise ValueError("normal input must have shape (N, 3) with N >= 4")
+    count = min(max(4, int(neighbours)), cloud.shape[0])
+    tree = NearestIndex(cloud)
+    _, indices = tree.query_k(cloud, count)
+    neighbourhoods = cloud[indices]
+    centered = neighbourhoods - neighbourhoods.mean(axis=1, keepdims=True)
+    covariance = np.einsum(
+        "nki,nkj->nij", centered, centered
+    ) / float(max(1, count - 1))
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    normals = eigenvectors[:, :, 0]
+    spread = np.maximum(eigenvalues.sum(axis=1), 1.0e-12)
+    curvature = np.maximum(eigenvalues[:, 0], 0.0) / spread
+    valid = (
+        np.isfinite(normals).all(axis=1)
+        & np.isfinite(curvature)
+        & (spread > 1.0e-8)
+        & (curvature <= float(max_curvature))
+    )
+    return normals, valid
+
+
+def _increment_from_twist(twist):
+    vector = np.asarray(twist, dtype=np.float64).reshape(6)
+    rotation, _ = cv2.Rodrigues(vector[:3].reshape(3, 1))
+    result = np.eye(4, dtype=np.float64)
+    result[:3, :3] = rotation
+    result[:3, 3] = vector[3:]
+    return result
+
+
+def register_rigid_scan(
+    source,
+    target,
+    max_correspondence,
+    max_iterations,
+    trim_fraction,
+    min_correspondences,
+    normal_neighbours=12,
+    huber_delta=0.03,
+    damping=1.0e-5,
+):
+    """Align a scan to a local submap with robust full-SE(3) point-to-plane ICP."""
+
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    if source.ndim != 2 or source.shape[1:] != (3,):
+        raise ValueError("source points must have shape (N, 3)")
+    if target.ndim != 2 or target.shape[1:] != (3,):
+        raise ValueError("target points must have shape (N, 3)")
+    minimum = max(6, int(min_correspondences))
+    if source.shape[0] < minimum or target.shape[0] < minimum:
+        raise ValueError("not enough points for RGB-D registration")
+    if not math.isfinite(max_correspondence) or max_correspondence <= 0.0:
+        raise ValueError("max_correspondence must be finite and positive")
+    if not 0.25 <= float(trim_fraction) <= 1.0:
+        raise ValueError("trim_fraction must be in [0.25, 1]")
+    if not math.isfinite(huber_delta) or huber_delta <= 0.0:
+        raise ValueError("huber_delta must be finite and positive")
+    if not math.isfinite(damping) or damping < 0.0:
+        raise ValueError("damping must be finite and non-negative")
+
+    tree = NearestIndex(target)
+    normals, normal_valid = estimate_normals(
+        target, neighbours=normal_neighbours
+    )
+    total = np.eye(4, dtype=np.float64)
+    previous_rmse = float("inf")
+    for _ in range(max(1, int(max_iterations))):
+        moved = transform_points_fast(source, total)
+        distances, indices = tree.query(moved)
+        valid = (
+            np.isfinite(distances)
+            & (distances < max_correspondence)
+            & normal_valid[indices]
+        )
+        selected = np.flatnonzero(valid)
+        if selected.size < minimum:
+            raise ValueError("too little scan-to-submap surface overlap")
+        selected_distances = distances[selected]
+        if trim_fraction < 1.0:
+            cutoff = np.percentile(
+                selected_distances, float(trim_fraction) * 100.0
+            )
+            selected = selected[selected_distances <= cutoff]
+        if selected.size < minimum:
+            raise ValueError("too few trimmed RGB-D surface correspondences")
+
+        moved_selected = moved[selected]
+        target_selected = target[indices[selected]]
+        normals_selected = normals[indices[selected]]
+        residuals = np.einsum(
+            "ij,ij->i", normals_selected, moved_selected - target_selected
+        )
+        absolute = np.abs(residuals)
+        weights = np.ones_like(residuals)
+        robust = absolute > huber_delta
+        weights[robust] = huber_delta / absolute[robust]
+        jacobian = np.column_stack(
+            (
+                np.cross(moved_selected, normals_selected),
+                normals_selected,
+            )
+        )
+        square_root_weight = np.sqrt(weights)
+        weighted_jacobian = jacobian * square_root_weight[:, None]
+        weighted_residual = residuals * square_root_weight
+        hessian = weighted_jacobian.T @ weighted_jacobian
+        gradient = weighted_jacobian.T @ weighted_residual
+        diagonal = np.maximum(np.diag(hessian), 1.0)
+        hessian += float(damping) * np.diag(diagonal)
+        try:
+            twist = np.linalg.solve(hessian, -gradient)
+        except np.linalg.LinAlgError:
+            increment = best_fit_rigid_transform(
+                moved_selected, target_selected
+            )
+        else:
+            rotation_norm = float(np.linalg.norm(twist[:3]))
+            maximum_rotation = math.radians(5.0)
+            if rotation_norm > maximum_rotation:
+                twist[:3] *= maximum_rotation / rotation_norm
+            translation_norm = float(np.linalg.norm(twist[3:]))
+            maximum_translation = 0.5 * float(max_correspondence)
+            if translation_norm > maximum_translation:
+                twist[3:] *= maximum_translation / translation_norm
+            increment = _increment_from_twist(twist)
+        total = increment @ total
+        rmse = float(np.sqrt(np.mean(np.square(residuals))))
+        step_translation = float(np.linalg.norm(increment[:3, 3]))
+        step_rotation = rotation_degrees(increment)
+        if (
+            abs(previous_rmse - rmse) < 1.0e-5
+            and step_translation < 1.0e-4
+            and step_rotation < 0.01
+        ):
+            break
+        previous_rmse = rmse
+
+    moved = transform_points_fast(source, total)
+    distances, indices = tree.query(moved)
+    inliers = (
+        np.isfinite(distances)
+        & (distances < max_correspondence)
+        & normal_valid[indices]
+    )
     inlier_count = int(inliers.sum())
     overlap = float(inlier_count) / float(source.shape[0])
     rmse = (

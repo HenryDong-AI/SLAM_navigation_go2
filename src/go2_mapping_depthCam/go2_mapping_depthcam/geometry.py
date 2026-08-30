@@ -1,8 +1,66 @@
-"""ROS-independent depth projection and rigid-transform helpers."""
+"""ROS-independent depth projection, time, and rigid-transform helpers."""
 
+import math
 from typing import Sequence
 
 import numpy as np
+
+
+class DeviceClockSynchronizer:
+    """Map a monotonic camera clock into ROS time using arrival timestamps.
+
+    RealSense hardware timestamps are not in the ROS clock epoch. The smallest
+    observed arrival-minus-device offset is the best available estimate because
+    scheduler and USB delay are non-negative. A bounded upward slew follows
+    slow clock drift without copying one late callback into future captures.
+    """
+
+    def __init__(self, max_slew_ns=200000, reset_error_ns=1000000000):
+        self.max_slew_ns = max(0, int(max_slew_ns))
+        self.reset_error_ns = max(1, int(reset_error_ns))
+        self.offset_ns = None
+        self.last_device_ns = None
+        self.last_stamp_ns = None
+        self.reset_count = 0
+
+    def reset(self):
+        self.offset_ns = None
+        self.last_device_ns = None
+        self.last_stamp_ns = None
+        self.reset_count += 1
+
+    def to_ros_ns(self, device_timestamp_ms, arrival_ros_ns):
+        device_ms = float(device_timestamp_ms)
+        arrival_ns = int(arrival_ros_ns)
+        if not math.isfinite(device_ms) or device_ms < 0.0 or arrival_ns <= 0:
+            raise ValueError(
+                "camera and ROS timestamps must be finite and positive"
+            )
+        device_ns = int(round(device_ms * 1000000.0))
+        sample_offset = arrival_ns - device_ns
+        reset_required = (
+            self.offset_ns is None
+            or self.last_device_ns is None
+            or device_ns <= self.last_device_ns
+            or abs(sample_offset - self.offset_ns) > self.reset_error_ns
+        )
+        if reset_required:
+            if self.offset_ns is not None:
+                self.reset_count += 1
+            self.offset_ns = sample_offset
+        elif sample_offset < self.offset_ns:
+            self.offset_ns = sample_offset
+        else:
+            self.offset_ns += min(
+                self.max_slew_ns, sample_offset - self.offset_ns
+            )
+
+        stamp_ns = min(arrival_ns, device_ns + self.offset_ns)
+        if self.last_stamp_ns is not None and stamp_ns <= self.last_stamp_ns:
+            stamp_ns = self.last_stamp_ns + 1
+        self.last_device_ns = device_ns
+        self.last_stamp_ns = stamp_ns
+        return int(stamp_ns)
 
 
 def rigid_transform(values: Sequence[float]) -> np.ndarray:
@@ -32,12 +90,122 @@ def quaternion_xyzw_to_matrix(quaternion: Sequence[float]) -> np.ndarray:
     x, y, z, w = q / norm
     return np.asarray(
         [
-            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
-            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
-            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+            [
+                1.0 - 2.0 * (y * y + z * z),
+                2.0 * (x * y - z * w),
+                2.0 * (x * z + y * w),
+            ],
+            [
+                2.0 * (x * y + z * w),
+                1.0 - 2.0 * (x * x + z * z),
+                2.0 * (y * z - x * w),
+            ],
+            [
+                2.0 * (x * z - y * w),
+                2.0 * (y * z + x * w),
+                1.0 - 2.0 * (x * x + y * y),
+            ],
         ],
         dtype=np.float64,
     )
+
+
+def matrix_to_quaternion_xyzw(rotation: np.ndarray) -> np.ndarray:
+    """Convert a valid 3x3 rotation matrix to a normalized XYZW quaternion."""
+
+    matrix = np.asarray(rotation, dtype=np.float64)
+    if matrix.shape != (3, 3) or not np.isfinite(matrix).all():
+        raise ValueError("rotation must be a finite 3x3 matrix")
+    if not np.allclose(matrix.T @ matrix, np.eye(3), atol=1.0e-5):
+        raise ValueError("rotation is not orthonormal")
+    trace = float(np.trace(matrix))
+    if trace > 0.0:
+        scale = math.sqrt(trace + 1.0) * 2.0
+        quaternion = np.asarray(
+            [
+                (matrix[2, 1] - matrix[1, 2]) / scale,
+                (matrix[0, 2] - matrix[2, 0]) / scale,
+                (matrix[1, 0] - matrix[0, 1]) / scale,
+                0.25 * scale,
+            ],
+            dtype=np.float64,
+        )
+    else:
+        axis = int(np.argmax(np.diag(matrix)))
+        if axis == 0:
+            scale = math.sqrt(
+                1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]
+            ) * 2.0
+            quaternion = np.asarray(
+                [
+                    0.25 * scale,
+                    (matrix[0, 1] + matrix[1, 0]) / scale,
+                    (matrix[0, 2] + matrix[2, 0]) / scale,
+                    (matrix[2, 1] - matrix[1, 2]) / scale,
+                ],
+                dtype=np.float64,
+            )
+        elif axis == 1:
+            scale = math.sqrt(
+                1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2]
+            ) * 2.0
+            quaternion = np.asarray(
+                [
+                    (matrix[0, 1] + matrix[1, 0]) / scale,
+                    0.25 * scale,
+                    (matrix[1, 2] + matrix[2, 1]) / scale,
+                    (matrix[0, 2] - matrix[2, 0]) / scale,
+                ],
+                dtype=np.float64,
+            )
+        else:
+            scale = math.sqrt(
+                1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1]
+            ) * 2.0
+            quaternion = np.asarray(
+                [
+                    (matrix[0, 2] + matrix[2, 0]) / scale,
+                    (matrix[1, 2] + matrix[2, 1]) / scale,
+                    0.25 * scale,
+                    (matrix[1, 0] - matrix[0, 1]) / scale,
+                ],
+                dtype=np.float64,
+            )
+    quaternion /= np.linalg.norm(quaternion)
+    return quaternion
+
+
+def interpolate_pose(first: np.ndarray, second: np.ndarray, fraction: float) -> np.ndarray:
+    """Interpolate two SE(3) poses with linear translation and quaternion SLERP."""
+
+    start = rigid_transform(np.asarray(first).reshape(-1))
+    finish = rigid_transform(np.asarray(second).reshape(-1))
+    amount = float(fraction)
+    if not math.isfinite(amount) or amount < 0.0 or amount > 1.0:
+        raise ValueError("interpolation fraction must be in [0, 1]")
+    q0 = matrix_to_quaternion_xyzw(start[:3, :3])
+    q1 = matrix_to_quaternion_xyzw(finish[:3, :3])
+    dot = float(np.dot(q0, q1))
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+    dot = min(1.0, max(-1.0, dot))
+    if dot > 0.9995:
+        quaternion = q0 + amount * (q1 - q0)
+        quaternion /= np.linalg.norm(quaternion)
+    else:
+        angle = math.acos(dot)
+        sine = math.sin(angle)
+        quaternion = (
+            math.sin((1.0 - amount) * angle) / sine * q0
+            + math.sin(amount * angle) / sine * q1
+        )
+    result = np.eye(4, dtype=np.float64)
+    result[:3, :3] = quaternion_xyzw_to_matrix(quaternion)
+    result[:3, 3] = (
+        (1.0 - amount) * start[:3, 3] + amount * finish[:3, 3]
+    )
+    return result
 
 
 def pose_matrix(position_xyz: Sequence[float], quaternion_xyzw: Sequence[float]) -> np.ndarray:

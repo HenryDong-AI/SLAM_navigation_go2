@@ -7,6 +7,7 @@ import os
 import threading
 import time
 from array import array
+from bisect import bisect_left
 from collections import deque
 
 import numpy as np
@@ -31,16 +32,21 @@ from go2_mapping.pointcloud import (
 )
 from go2_mapping.state_io import load_snapshot, save_snapshot
 from go2_mapping.time_sync_guard import TimeSyncStatusGuard
-from go2_mapping.voxel_map import VoxelAccumulator
 
-from .geometry import pose_matrix, rigid_transform, transform_points
+from .geometry import (
+    interpolate_pose,
+    pose_matrix,
+    rigid_transform,
+    transform_points,
+)
 from .registration import (
-    planar_rotation_degrees,
-    register_planar_scan,
-    scale_planar_transform,
+    register_rigid_scan,
+    rotation_degrees,
+    scale_rigid_transform,
     transform_points_fast,
     voxel_downsample,
 )
+from .surface_map import RgbdSurfaceAccumulator
 
 
 def _stamp_ns(message):
@@ -116,6 +122,9 @@ class DepthMappingNode(Node):
             self._param("max_camera_age_sec", 0.50)
         )
         self._max_odom_delta = float(self._param("max_odom_delta_sec", 0.15))
+        self._max_odom_interpolation_gap = float(
+            self._param("max_odom_interpolation_gap_sec", 0.30)
+        )
         odom_buffer_size = max(2, int(self._param("odom_buffer_size", 100)))
         self._odom_buffer = deque(maxlen=odom_buffer_size)
         # The bridge publishes geometry and RGB in one message, so no
@@ -152,6 +161,25 @@ class DepthMappingNode(Node):
         self._relative_max_z = float(self._param("max_relative_z", 2.00))
         self._max_voxels = int(self._param("max_voxels", 300000))
         self._retention_radius = float(self._param("retention_radius", 0.0))
+        self._surface_max_observation_weight = max(
+            1, int(self._param("surface_max_observation_weight", 32))
+        )
+        self._surface_min_observations = max(
+            1, int(self._param("surface_min_observations", 2))
+        )
+        self._surface_max_variance = float(
+            self._param("surface_max_variance", 0.0016)
+        )
+        self._fusion_min_translation = float(
+            self._param("fusion_min_translation", 0.025)
+        )
+        self._fusion_min_rotation_deg = float(
+            self._param("fusion_min_rotation_deg", 1.0)
+        )
+        self._fusion_max_interval_sec = float(
+            self._param("fusion_max_interval_sec", 1.0)
+        )
+
         self._grid_resolution = float(self._param("grid_resolution", 0.10))
         self._max_dense_grid_cells = int(
             self._param("max_dense_grid_cells", 2_000_000)
@@ -173,9 +201,9 @@ class DepthMappingNode(Node):
         self._max_ray_cells = int(self._param("max_ray_cells", 4096))
         self._publish_rate_hz = float(self._param("publish_rate_hz", 1.0))
 
-        # Go2 odometry remains the initial pose estimate. Bounded planar ICP
-        # aligns each moving RGB-D scan to a short recent submap before the
-        # permanent voxel map is updated, reducing duplicated object edges.
+        # Interpolated Go2 odometry is the initial pose estimate. Bounded full
+        # SE(3) registration aligns moving RGB-D keyframes to a local submap
+        # before confidence-weighted surface fusion.
         self._registration_enabled = bool(
             self._param("registration_enabled", True)
         )
@@ -231,6 +259,16 @@ class DepthMappingNode(Node):
             1,
             int(self._param("registration_reseed_after_rejections", 3)),
         )
+        self._registration_normal_neighbours = max(
+            4, int(self._param("registration_normal_neighbours", 12))
+        )
+        self._registration_huber_delta = float(
+            self._param("registration_huber_delta", 0.03)
+        )
+        self._registration_damping = float(
+            self._param("registration_damping", 1.0e-5)
+        )
+
         if self._registration_enabled:
             if self._registration_rate_hz <= 0.0:
                 raise ValueError("registration_rate_hz must be positive")
@@ -287,7 +325,7 @@ class DepthMappingNode(Node):
         )
         time_sync_required = bool(self._param("time_sync_required", True))
 
-        self._voxels = VoxelAccumulator(
+        self._voxels = RgbdSurfaceAccumulator(
             voxel_size=self._voxel_size,
             min_point_range=self._min_point_range,
             max_point_range=self._max_point_range,
@@ -295,6 +333,9 @@ class DepthMappingNode(Node):
             max_relative_z=self._relative_max_z,
             max_voxels=self._max_voxels,
             retention_radius=self._retention_radius,
+            max_observation_weight=self._surface_max_observation_weight,
+            min_observations=self._surface_min_observations,
+            max_surface_variance=self._surface_max_variance,
         )
         self._grid = LogOddsGrid(
             resolution=self._grid_resolution,
@@ -320,6 +361,13 @@ class DepthMappingNode(Node):
         self._last_input_monotonic = 0.0
         self._last_fused_monotonic = 0.0
         self._last_error = ""
+        self._frames_registration_skipped = 0
+        self._frames_keyframe_skipped = 0
+        self._odom_interpolated_frames = 0
+        self._odom_nearest_frames = 0
+        self._last_fusion_pose = None
+        self._last_fusion_stamp_ns = 0
+
         self._last_registration_correction = np.eye(4, dtype=np.float64)
         self._registration_submap = deque(
             maxlen=self._registration_submap_frames
@@ -398,7 +446,7 @@ class DepthMappingNode(Node):
 
         self.get_logger().info(
             "D435i atomic-cloud mapper configured: cloud=%s odom=%s "
-            "voxel=%.3f m planar_registration=%s output=%s"
+            "voxel=%.3f m se3_registration=%s output=%s"
             % (
                 self._camera_cloud_topic,
                 self._odom_topic,
@@ -469,7 +517,25 @@ class DepthMappingNode(Node):
         with self._lock:
             if not self._time_guard.ready:
                 return
-            self._odom_buffer.append((_stamp_ns(message), transform))
+            stamp_ns = _stamp_ns(message)
+            if stamp_ns <= 0:
+                return
+            sample = (stamp_ns, transform)
+            if not self._odom_buffer or stamp_ns > self._odom_buffer[-1][0]:
+                self._odom_buffer.append(sample)
+            elif stamp_ns == self._odom_buffer[-1][0]:
+                self._odom_buffer[-1] = sample
+            else:
+                ordered = [
+                    item for item in self._odom_buffer
+                    if item[0] != stamp_ns
+                ]
+                ordered.append(sample)
+                ordered.sort(key=lambda item: item[0])
+                self._odom_buffer = deque(
+                    ordered[-self._odom_buffer.maxlen:],
+                    maxlen=self._odom_buffer.maxlen,
+                )
 
     def _on_time_sync(self, message):
         became_faulted = False
@@ -508,26 +574,57 @@ class DepthMappingNode(Node):
                     self._processing_wake.clear()
                     self._last_camera_stamp_ns = -1
                     self._last_fused_monotonic = 0.0
+                    self._last_fusion_pose = None
+                    self._last_fusion_stamp_ns = 0
                     self._last_error = fault_reason
             self.get_logger().error(
                 "mapping time-sync fault latched: %s; restart the complete stack"
                 % fault_reason
             )
 
-    def _nearest_odometry(self, stamp_ns):
+    def _odometry_at(self, stamp_ns):
+        """Return the capture-time pose, interpolating bracketing odometry."""
+
         if not self._odom_buffer:
-            return None, None
-        sample_stamp, transform = min(
-            self._odom_buffer, key=lambda item: abs(item[0] - stamp_ns)
+            return None, None, False
+        samples = list(self._odom_buffer)
+        stamps = [item[0] for item in samples]
+        index = bisect_left(stamps, int(stamp_ns))
+        if index < len(samples) and samples[index][0] == stamp_ns:
+            return samples[index][1].copy(), 0.0, False
+        if index == 0:
+            sample_stamp, transform = samples[0]
+            return transform.copy(), abs(sample_stamp - stamp_ns) * 1.0e-9, False
+        if index >= len(samples):
+            sample_stamp, transform = samples[-1]
+            return transform.copy(), abs(sample_stamp - stamp_ns) * 1.0e-9, False
+        before_stamp, before_pose = samples[index - 1]
+        after_stamp, after_pose = samples[index]
+        gap_sec = (after_stamp - before_stamp) * 1.0e-9
+        nearest_delta = min(
+            stamp_ns - before_stamp, after_stamp - stamp_ns
+        ) * 1.0e-9
+        if gap_sec <= 0.0 or gap_sec > self._max_odom_interpolation_gap:
+            nearest_pose = (
+                before_pose
+                if stamp_ns - before_stamp <= after_stamp - stamp_ns
+                else after_pose
+            )
+            return nearest_pose.copy(), nearest_delta, False
+        fraction = float(stamp_ns - before_stamp) / float(
+            after_stamp - before_stamp
         )
-        delta_sec = abs(sample_stamp - stamp_ns) * 1.0e-9
-        return transform, delta_sec
+        return (
+            interpolate_pose(before_pose, after_pose, fraction),
+            nearest_delta,
+            True,
+        )
 
     @staticmethod
-    def _planar_pose_delta(previous, current):
+    def _pose_delta(previous, current):
         relative = np.linalg.inv(previous) @ current
-        translation = float(np.linalg.norm(relative[:2, 3]))
-        rotation = planar_rotation_degrees(relative)
+        translation = float(np.linalg.norm(relative[:3, 3]))
+        rotation = rotation_degrees(relative)
         return translation, rotation
 
     def _registration_target(self):
@@ -542,7 +639,7 @@ class DepthMappingNode(Node):
         )
 
     def _maybe_register(self, points_world, raw_odom_from_base):
-        """Correct only a predicted scan against the recent RGB-D submap."""
+        """Correct a predicted scan and decide whether it is safe to fuse."""
 
         with self._map_lock:
             previous_raw_pose = (
@@ -550,10 +647,11 @@ class DepthMappingNode(Node):
                 if self._last_registration_raw_pose is not None
                 else None
             )
-        # Registration is deliberately map-only. It never changes /go2/odom
-        # or the odom -> base_link TF consumed by Nav2 and the motion gate.
+            last_delta = self._last_registration_correction.copy()
+        # Registration is map-only. It never changes /go2/odom, TF, Nav2, or
+        # any motion command.
         if not self._registration_enabled:
-            return points_world, False
+            return points_world, False, True
 
         target = self._registration_target()
         if target.shape[0] < self._registration_min_correspondences:
@@ -561,14 +659,12 @@ class DepthMappingNode(Node):
                 self._registration_state = "initializing"
                 self._last_registration_raw_pose = raw_odom_from_base.copy()
                 self._registration_consecutive_rejections = 0
-            return points_world, True
+            return points_world, True, True
 
         now_mono = time.monotonic()
         period = 1.0 / self._registration_rate_hz
-        moved = 0.0
-        turned = 0.0
         if previous_raw_pose is not None:
-            moved, turned = self._planar_pose_delta(
+            moved, turned = self._pose_delta(
                 previous_raw_pose, raw_odom_from_base
             )
             if (
@@ -577,18 +673,21 @@ class DepthMappingNode(Node):
             ):
                 with self._map_lock:
                     self._registration_state = "stationary"
-                return points_world, True
+                return (
+                    transform_points_fast(points_world, last_delta),
+                    True,
+                    True,
+                )
         with self._map_lock:
             registration_due = (
                 now_mono - self._last_registration_monotonic >= period
             )
-            last_delta = self._last_registration_correction.copy()
         if not registration_due:
-            # Preserve the last confirmed local target while the robot moves;
-            # the next rate-limited attempt will align against that target.
-            # Reuse the last accepted bounded correction so intermediate
-            # moving frames do not reintroduce raw-odometry edge smear.
-            return transform_points_fast(points_world, last_delta), False
+            return (
+                transform_points_fast(points_world, last_delta),
+                False,
+                True,
+            )
 
         source = voxel_downsample(
             points_world,
@@ -599,16 +698,19 @@ class DepthMappingNode(Node):
             self._last_registration_monotonic = now_mono
             self._registration_attempts += 1
         try:
-            delta, rmse, overlap, _ = register_planar_scan(
+            delta, rmse, overlap, _ = register_rigid_scan(
                 source,
                 target,
                 self._registration_max_correspondence,
                 self._registration_iterations,
                 self._registration_trim_fraction,
                 self._registration_min_correspondences,
+                normal_neighbours=self._registration_normal_neighbours,
+                huber_delta=self._registration_huber_delta,
+                damping=self._registration_damping,
             )
-            translation = float(np.linalg.norm(delta[:2, 3]))
-            rotation = planar_rotation_degrees(delta)
+            translation = float(np.linalg.norm(delta[:3, 3]))
+            rotation = rotation_degrees(delta)
             rejection = ""
             if overlap < self._registration_min_overlap:
                 rejection = "overlap {:.1%} is below {:.1%}".format(
@@ -626,7 +728,7 @@ class DepthMappingNode(Node):
                 rejection = "rotation {:.2f} deg exceeds {:.2f} deg".format(
                     rotation, self._registration_max_rotation_deg
                 )
-        except Exception as exc:  # OpenCV/registration safety boundary
+        except Exception as exc:
             delta = None
             rmse = None
             overlap = None
@@ -646,9 +748,6 @@ class DepthMappingNode(Node):
                 self._registration_consecutive_rejections += 1
                 self._registration_state = "rejected"
                 self._registration_last_reason = rejection
-                self._last_registration_correction = np.eye(
-                    4, dtype=np.float64
-                )
                 if (
                     self._registration_consecutive_rejections
                     >= self._registration_reseed_after_rejections
@@ -660,6 +759,9 @@ class DepthMappingNode(Node):
                     self._registration_submap.append(source.copy())
                     self._last_registration_raw_pose = (
                         raw_odom_from_base.copy()
+                    )
+                    self._last_registration_correction = np.eye(
+                        4, dtype=np.float64
                     )
                     self._registration_consecutive_rejections = 0
                     self._registration_submap_reseeds += 1
@@ -680,15 +782,14 @@ class DepthMappingNode(Node):
             else:
                 self._warn_throttled(
                     "rgbd_registration",
-                    "RGB-D registration rejected: %s; using guarded Go2 "
-                    "odometry" % rejection,
+                    "RGB-D registration rejected: %s; frame excluded from "
+                    "the permanent map" % rejection,
                 )
-            # Do not put this unconfirmed moving scan into the registration
-            # submap unless the explicit recovery above has just replaced the
-            # stale target. Geometry follows the guarded Go2 odometry pose.
-            return points_world, False
+            # Never contaminate the permanent map with an unconfirmed moving
+            # scan. The current scan may seed only the short recovery target.
+            return points_world, False, False
 
-        applied_delta = scale_planar_transform(
+        applied_delta = scale_rigid_transform(
             delta, self._registration_gain
         )
         corrected_points = transform_points_fast(points_world, applied_delta)
@@ -702,7 +803,7 @@ class DepthMappingNode(Node):
             accepted_count = self._registration_accepted
         if accepted_count == 1 or accepted_count % 20 == 0:
             self.get_logger().info(
-                "RGB-D registration tracking: accepted=%d rmse=%.3f m "
+                "RGB-D SE(3) registration: accepted=%d rmse=%.3f m "
                 "overlap=%.1f%% correction=%.3f m/%.2f deg"
                 % (
                     accepted_count,
@@ -712,7 +813,7 @@ class DepthMappingNode(Node):
                     rotation,
                 )
             )
-        return corrected_points, True
+        return corrected_points, True, True
 
     def _update_registration_submap(self, points_world):
         if not self._registration_enabled:
@@ -726,6 +827,19 @@ class DepthMappingNode(Node):
             return
         with self._map_lock:
             self._registration_submap.append(frame)
+
+    def _should_fuse_keyframe(self, pose, stamp_ns):
+        if self._last_fusion_pose is None or self._last_fusion_stamp_ns <= 0:
+            return True
+        translation, rotation = self._pose_delta(
+            self._last_fusion_pose, pose
+        )
+        elapsed = (int(stamp_ns) - self._last_fusion_stamp_ns) * 1.0e-9
+        return (
+            translation >= self._fusion_min_translation
+            or rotation >= self._fusion_min_rotation_deg
+            or elapsed >= self._fusion_max_interval_sec
+        )
 
     def _record_drop(self, error=""):
         with self._lock:
@@ -815,7 +929,7 @@ class DepthMappingNode(Node):
         if age_sec > self._max_camera_age:
             self._record_drop()
             self._warn_throttled(
-                "camera_cloud_age", "camera-cloud timestamp is stale"
+                "camera_cloud_age", "camera capture timestamp is stale"
             )
             return
 
@@ -826,7 +940,13 @@ class DepthMappingNode(Node):
                     "time_sync", "waiting for a locked sensor time boundary"
                 )
                 return
-            odom_from_base, odom_delta = self._nearest_odometry(stamp_ns)
+            odom_from_base, odom_delta, interpolated = self._odometry_at(
+                stamp_ns
+            )
+            if interpolated:
+                self._odom_interpolated_frames += 1
+            else:
+                self._odom_nearest_frames += 1
 
         if odom_from_base is None:
             self._record_drop()
@@ -836,7 +956,7 @@ class DepthMappingNode(Node):
             self._record_drop()
             self._warn_throttled(
                 "odom_delta",
-                "camera cloud and nearest odometry are too far apart",
+                "camera capture and buffered odometry are too far apart",
             )
             return
         if message.header.frame_id != self._expected_camera_frame:
@@ -877,14 +997,30 @@ class DepthMappingNode(Node):
             self._record_drop()
             return
 
-        accepted, update_submap = self._maybe_register(
+        accepted, update_submap, fusion_allowed = self._maybe_register(
             accepted, odom_from_base
         )
+        if not fusion_allowed:
+            with self._lock:
+                self._last_camera_stamp_ns = stamp_ns
+                self._frames_registration_skipped += 1
+            self._last_process_monotonic = now_mono
+            return
+
         corrected_mask = self._voxels.filter_mask(accepted, robot_position)
         accepted = accepted[corrected_mask]
         accepted_colors = accepted_colors[corrected_mask]
         if accepted.shape[0] == 0:
             self._record_drop()
+            return
+        if update_submap:
+            self._update_registration_submap(accepted)
+
+        if not self._should_fuse_keyframe(odom_from_base, stamp_ns):
+            with self._lock:
+                self._last_camera_stamp_ns = stamp_ns
+                self._frames_keyframe_skipped += 1
+            self._last_process_monotonic = now_mono
             return
 
         with self._map_lock:
@@ -897,9 +1033,9 @@ class DepthMappingNode(Node):
             self._last_sensor_stamp_ns = stamp_ns
             self._frames_fused += 1
             self._last_fused_monotonic = time.monotonic()
+            self._last_fusion_pose = odom_from_base.copy()
+            self._last_fusion_stamp_ns = stamp_ns
             self._last_error = ""
-        if update_submap:
-            self._update_registration_submap(accepted)
         self._last_process_monotonic = now_mono
 
     def _point_cloud_message(self, points, colors_rgb, stamp_ns):
@@ -1085,6 +1221,14 @@ class DepthMappingNode(Node):
                 },
                 "frames_received": self._frames_received,
                 "frames_fused": self._frames_fused,
+                "frames_registration_skipped": (
+                    self._frames_registration_skipped
+                ),
+                "frames_keyframe_skipped": self._frames_keyframe_skipped,
+                "odometry_pose_source": {
+                    "interpolated": self._odom_interpolated_frames,
+                    "nearest_or_exact": self._odom_nearest_frames,
+                },
                 "frames_dropped": self._frames_dropped,
                 "frames_superseded": self._frames_superseded,
                 "input_age_sec": (
@@ -1102,6 +1246,7 @@ class DepthMappingNode(Node):
                 "latest_cloud_pending": self._latest_camera_cloud is not None,
                 "processing_active": self._processing_active,
                 "processing_worker_alive": self._processing_thread.is_alive(),
+                "surface_fusion": "confidence_weighted_rgbd_surfel_voxels",
                 "output": output_status,
                 "rgb_fusion": True,
                 "last_error": self._last_error,
@@ -1112,9 +1257,10 @@ class DepthMappingNode(Node):
                 {
                     "voxel_count": len(self._voxels),
                     "colorized_voxel_count": self._voxels.colorized_count(),
+                    "surface_voxel_count": self._voxels.surface_count(),
                     "registration": {
                         "enabled": self._registration_enabled,
-                        "type": "planar_scan_to_local_submap",
+                        "type": "full_se3_point_to_plane_local_submap",
                         "state": self._registration_state,
                         "attempts": self._registration_attempts,
                         "accepted": self._registration_accepted,
@@ -1154,11 +1300,14 @@ class DepthMappingNode(Node):
             "camera_frame": self._expected_camera_frame,
             "camera_cloud_topic": self._camera_cloud_topic,
             "voxel_size": self._voxel_size,
+            "surface_fusion": "confidence_weighted_rgbd_surfel_voxels",
+            "surface_min_observations": self._surface_min_observations,
+            "surface_max_variance": self._surface_max_variance,
             "grid_resolution": self._grid_resolution,
             "base_from_camera_optical": self._base_from_camera.reshape(-1).tolist(),
             "extrinsics_confirmed": self._extrinsics_confirmed,
             "registration_enabled": self._registration_enabled,
-            "registration_type": "planar_scan_to_local_submap",
+            "registration_type": "full_se3_point_to_plane_local_submap",
             "registration_attempts": self._registration_attempts,
             "registration_accepted": self._registration_accepted,
             "registration_rejected": self._registration_rejected,
@@ -1268,6 +1417,12 @@ class DepthMappingNode(Node):
                 self._last_camera_stamp_ns = -1
                 self._last_fused_monotonic = 0.0
                 self._frames_fused = 0
+                self._frames_registration_skipped = 0
+                self._frames_keyframe_skipped = 0
+                self._odom_interpolated_frames = 0
+                self._odom_nearest_frames = 0
+                self._last_fusion_pose = None
+                self._last_fusion_stamp_ns = 0
         response.success = True
         response.message = "depth-camera map cleared"
         return response

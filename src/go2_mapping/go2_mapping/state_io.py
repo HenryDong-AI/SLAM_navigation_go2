@@ -215,7 +215,7 @@ def load_snapshot(path: str) -> Tuple[Dict[str, np.ndarray], Dict[str, object]]:
         "grid_last_robot_cell",
         "metadata_json",
     }
-    optional = {"voxel_colors", "voxel_color_counts"}
+    optional = {"voxel_colors", "voxel_color_counts", "voxel_variances"}
     with np.load(str(state_path), allow_pickle=False) as archive:
         missing = required.difference(archive.files)
         if missing:

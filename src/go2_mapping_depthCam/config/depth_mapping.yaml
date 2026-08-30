@@ -31,6 +31,19 @@ depth_camera_bridge:
     pointcloud_min_depth: 0.25
     pointcloud_max_depth: 3.0
     pointcloud_max_points: 60000
+    # Edge-preserving disparity-domain filtering removes much of the D435i
+    # flying-pixel halo. Temporal filtering and hole filling stay off because
+    # both can copy obsolete geometry while the robot is walking.
+    depth_spatial_filter: true
+    depth_spatial_magnitude: 2
+    depth_spatial_alpha: 0.50
+    depth_spatial_delta: 20.0
+    depth_spatial_holes_fill: 0
+    depth_temporal_filter: false
+    depth_temporal_alpha: 0.40
+    depth_temporal_delta: 20.0
+    depth_hole_filling_mode: -1
+
 
 go2_mapping_depthcam:
   ros__parameters:
@@ -61,31 +74,38 @@ go2_mapping_depthcam:
     max_camera_points: 60000
     max_camera_age_sec: 0.50
     max_odom_delta_sec: 0.15
+    # Reject only when no safe bracketing/interpolated odometry exists.
+    max_odom_interpolation_gap_sec: 0.30
+
     odom_buffer_size: 100
 
-    # Correct moving depth scans against a short recent RGB-D submap before
-    # voxel fusion. This is deliberately map-only: /go2/odom, the robot TF,
-    # Nav2, and the motion gate are never modified by registration.
+    # Robust full-SE(3) point-to-plane correction against a recent RGB-D
+    # submap. This remains map-only: robot odometry, TF, Nav2, and motion
+    # commands are never changed.
     registration_enabled: true
-    registration_rate_hz: 2.0
-    registration_voxel_size: 0.06
-    registration_submap_frames: 5
-    registration_max_source_points: 5000
-    registration_max_target_points: 12000
-    registration_max_correspondence: 0.14
-    registration_iterations: 8
-    registration_trim_fraction: 0.75
-    registration_min_correspondences: 250
-    registration_min_overlap: 0.35
-    registration_max_rmse: 0.07
-    registration_max_translation: 0.10
-    registration_max_rotation_deg: 4.0
-    registration_gain: 0.60
-    registration_min_motion_translation: 0.015
-    registration_min_motion_rotation_deg: 0.50
-    # A rejected scan is fused with guarded Go2 odometry. After this many
-    # consecutive failures, replace only the short ICP target submap with the
-    # current scan so registration cannot remain locked to an old location.
+    registration_rate_hz: 3.0
+    registration_voxel_size: 0.05
+    registration_submap_frames: 6
+    # Bounded for the Go2 Jetson: measured at about 0.16 s per full-SE(3)
+    # solve, below the 0.33 s registration period, without starving capture.
+    registration_max_source_points: 2000
+    registration_max_target_points: 5000
+    registration_max_correspondence: 0.12
+    registration_iterations: 6
+    registration_trim_fraction: 0.80
+    registration_min_correspondences: 120
+    registration_min_overlap: 0.40
+    registration_max_rmse: 0.06
+    registration_max_translation: 0.12
+    registration_max_rotation_deg: 5.0
+    registration_gain: 0.75
+    registration_min_motion_translation: 0.020
+    registration_min_motion_rotation_deg: 0.75
+    registration_normal_neighbours: 10
+    registration_huber_delta: 0.03
+    registration_damping: 0.00001
+    # Rejected moving scans never enter the permanent map. This recovery only
+    # reseeds the short registration target after repeated failures.
     registration_reseed_after_rejections: 3
 
     # Keep the requested 4 cm final map grid. Registration, not smaller
@@ -100,6 +120,18 @@ go2_mapping_depthcam:
 
     grid_resolution: 0.10
     obstacle_min_height: -0.22
+    # Equal frame weighting prevents a close, pixel-dense view from dominating
+    # a surface. Require two consistent observations before publishing/saving.
+    surface_max_observation_weight: 32
+    surface_min_observations: 2
+    surface_max_variance: 0.0016
+
+    # Fuse motion/time keyframes instead of every duplicate stationary frame.
+    # The one-second interval still accumulates depth confidence while stopped.
+    fusion_min_translation: 0.025
+    fusion_min_rotation_deg: 1.0
+    fusion_max_interval_sec: 1.0
+
     obstacle_max_height: 0.50
     hit_log_odds: 0.85
     miss_log_odds: -0.40

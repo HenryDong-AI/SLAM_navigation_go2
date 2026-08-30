@@ -171,40 +171,36 @@ The LiDAR mapper remains the default. Select exactly one geometric map backend:
 ```
 
 The depth-camera backend bypasses `go2_mapping_node` but keeps its public map
-topics and Nav2 interfaces. Each aligned depth pixel is reconstructed in 3D,
-keeps the RGB value from the same pixel, and contributes to a weighted XYZ and
-RGB average in its world-frame voxel. `/go2/map/cloud` therefore contains
-`x`, `y`, `z`, and packed `rgb` fields. The RViz **3D Map** display uses those
-measured colors automatically. The D435i captures 848x480 at its native 15 Hz profile and publishes the
-newest bounded XYZRGB cloud at 5 Hz with `pointcloud_pixel_stride: 2`. The
-bridge places aligned XYZ and RGB from each capture into one atomic
-`/go2/depth_camera/points` message. Publisher and subscriber both use
-KEEP_LAST depth 1, and the mapper has one latest-only cloud mailbox. There are
-no independent RGB/depth queues or downstream timestamp pairing, so delayed
-callbacks cannot leave mismatched frames that permanently stop fusion.
+topics and Nav2 interfaces. The D435i captures 848x480 at 15 Hz and publishes a
+bounded atomic XYZRGB cloud at 5 Hz. Edge-preserving disparity-domain filtering
+removes many depth-edge flying pixels; temporal filtering and hole filling stay
+off to avoid dragging old geometry while the Go2 walks.
 
-Full `/go2/map/cloud` serialization, occupancy publication, and 60-second
-autosave are request-coalesced on a separate output worker. Sensor/mailbox
-state and map/registration state also use separate locks, so growing-map output
-cannot block camera or odometry intake. Redundant display requests may be
-coalesced, but the newest complete input remains available to fusion. The final
-voxel size remains 0.04 m.
+Every cloud uses the RealSense hardware capture time mapped into ROS time. The
+mapper interpolates translation and orientation between bracketing Go2
+odometry samples, transforms the cloud at that capture boundary, then applies
+bounded full-SE(3) point-to-plane registration against a six-keyframe local
+submap. Corrections remain map-only and never change `/go2/odom`, TF, Nav2,
+the motion gate, or robot commands.
 
-Before a moving RGB-D scan enters the permanent map, bounded planar ICP aligns
-it to a five-frame local RGB-D submap. Corrections are accepted only with
-sufficient overlap and low RMSE and are limited to 0.10 m and 4 degrees. This
-registration is map-only: it never changes `/go2/odom`, `odom -> base_link`,
-Nav2, or the motion gate. It reduces local duplicate edges, but it is not a
-global pose graph or loop-closure system, so long trajectories can still drift.
-If ICP rejects a scan, its points still enter the permanent voxel map using the
-guarded Go2 odometry pose.
-After three consecutive registration failures, the mapper keeps the permanent
-map but reseeds its short local ICP target from the current odometry-positioned
-scan. This prevents a lost target from remaining permanently stale. Its
-`base_link <- d435i_color_optical_frame` transform was measured on this Go2
-by registering 30 stationary D435i/LiDAR pairs (4.38 cm nearest-surface RMSE,
-96.5% overlap). The result is stored in
-`src/go2_mapping_depthCam/config/depth_mapping.yaml`.
+A rejected moving scan is not fused into the permanent map. After three
+consecutive failures only the short registration target is reseeded so tracking
+can recover without contaminating existing geometry. This prevents the old
+failure mode where a rejected cloud was permanently stamped into the map with
+an unconfirmed pose.
+
+Accepted keyframes use confidence-weighted RGB-D surface fusion. Each camera
+frame contributes at most one equal-weight XYZRGB observation to a voxel, so a
+close view with many pixels cannot dominate previous geometry. A voxel must be
+observed consistently at least twice before it appears in `/go2/map/cloud` or
+a saved `map.ply`. The final spatial grid remains 0.04 m.
+
+Full map publication and 60-second autosave run on a separate coalescing worker.
+The approach improves local object surfaces, but it is not a global pose graph
+or loop-closure system; long trajectories can still drift. The measured
+`base_link <- d435i_color_optical_frame` transform remains in
+`src/go2_mapping_depthCam/config/depth_mapping.yaml` and must be recalibrated
+if the camera bracket moves.
 
 If the D435i bracket is moved, keep the robot stationary in a scene containing
 several non-parallel surfaces and recalibrate while the complete stack runs:
@@ -249,16 +245,14 @@ ros2 topic echo -f /go2/depth_camera/status
 # It must report: "state":"streaming"
 
 ros2 topic echo -f /go2/mapping/status
-# It must report "state": "mapping", input_type:
-# "atomic_xyzrgb_pointcloud2", and increasing frames_fused/voxel_count.
-# output.worker_alive must remain true. input_age_sec should normally stay
-# below max_camera_age_sec (0.50 s), even during slow map publication/autosave.
-# A rising publish_coalesced value means display serialization is slower than
-# its requested rate; fusion should still increase independently.
-# frames_superseded may rise by design when processing is slower than 5 Hz: it
-# means a complete older cloud was replaced by the newest complete cloud. While
-# moving, registration accepted or rejected should increase; rejected scans
-# still fuse via odometry.
+# It must report state=mapping, a rising frames_fused value, and
+# surface_voxel_count > 0 after a surface is seen by at least two keyframes.
+# odometry_pose_source.interpolated should normally rise while walking.
+# registration.accepted should rise during motion. A rejected scan increments
+# registration.rejected and frames_registration_skipped; it does NOT fuse.
+# frames_keyframe_skipped is expected for duplicate stationary frames.
+# output.worker_alive must remain true. frames_superseded may rise when an
+# older complete cloud is replaced by the newest complete cloud.
 
 ros2 topic hz /go2/depth_camera/points
 # Expect approximately 5 Hz while the D435i status says streaming.

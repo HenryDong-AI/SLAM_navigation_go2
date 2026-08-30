@@ -20,7 +20,7 @@ from std_msgs.msg import String
 
 from go2_mapping.pointcloud import xyzrgb_to_float32_bytes
 
-from .geometry import depth_to_camera_points_rgb
+from .geometry import DeviceClockSynchronizer, depth_to_camera_points_rgb
 
 
 class DepthCameraBridge(Node):
@@ -31,6 +31,11 @@ class DepthCameraBridge(Node):
         self._pipeline = None
         self._align = None
         self._rs = None
+        self._depth_filters = []
+        self._capture_clock = DeviceClockSynchronizer()
+        self._capture_timestamp_domain = "unknown"
+        self._last_capture_latency_sec = None
+        self._last_capture_stamp_ns = 0
         self._last_publish_monotonic = 0.0
         self._last_frame_monotonic = 0.0
         self._last_error_monotonic = 0.0
@@ -96,6 +101,33 @@ class DepthCameraBridge(Node):
         )
         self.pointcloud_max_points = max(
             1, int(self._parameter("pointcloud_max_points", 60000))
+        )
+        self.depth_spatial_filter = bool(
+            self._parameter("depth_spatial_filter", True)
+        )
+        self.depth_spatial_magnitude = int(
+            self._parameter("depth_spatial_magnitude", 2)
+        )
+        self.depth_spatial_alpha = float(
+            self._parameter("depth_spatial_alpha", 0.50)
+        )
+        self.depth_spatial_delta = float(
+            self._parameter("depth_spatial_delta", 20.0)
+        )
+        self.depth_spatial_holes_fill = int(
+            self._parameter("depth_spatial_holes_fill", 0)
+        )
+        self.depth_temporal_filter = bool(
+            self._parameter("depth_temporal_filter", False)
+        )
+        self.depth_temporal_alpha = float(
+            self._parameter("depth_temporal_alpha", 0.40)
+        )
+        self.depth_temporal_delta = float(
+            self._parameter("depth_temporal_delta", 20.0)
+        )
+        self.depth_hole_filling_mode = int(
+            self._parameter("depth_hole_filling_mode", -1)
         )
 
         if min(self.width, self.height, self.fps) <= 0:
@@ -235,7 +267,69 @@ class DepthCameraBridge(Node):
         self._depth_scale = float(
             profile.get_device().first_depth_sensor().get_depth_scale()
         )
+        self._configure_depth_filters()
         return profile
+
+    @staticmethod
+    def _set_filter_option(processing_filter, option, value):
+        try:
+            processing_filter.set_option(option, float(value))
+        except RuntimeError:
+            # Older librealsense builds omit a few optional filter controls.
+            pass
+
+    def _configure_depth_filters(self):
+        self._depth_filters = []
+        if not (self.depth_spatial_filter or self.depth_temporal_filter):
+            return
+        self._depth_filters.append(self._rs.disparity_transform(True))
+        if self.depth_spatial_filter:
+            spatial = self._rs.spatial_filter()
+            self._set_filter_option(
+                spatial, self._rs.option.filter_magnitude,
+                self.depth_spatial_magnitude,
+            )
+            self._set_filter_option(
+                spatial, self._rs.option.filter_smooth_alpha,
+                self.depth_spatial_alpha,
+            )
+            self._set_filter_option(
+                spatial, self._rs.option.filter_smooth_delta,
+                self.depth_spatial_delta,
+            )
+            self._set_filter_option(
+                spatial, self._rs.option.holes_fill,
+                self.depth_spatial_holes_fill,
+            )
+            self._depth_filters.append(spatial)
+        if self.depth_temporal_filter:
+            temporal = self._rs.temporal_filter()
+            self._set_filter_option(
+                temporal, self._rs.option.filter_smooth_alpha,
+                self.depth_temporal_alpha,
+            )
+            self._set_filter_option(
+                temporal, self._rs.option.filter_smooth_delta,
+                self.depth_temporal_delta,
+            )
+            self._depth_filters.append(temporal)
+        self._depth_filters.append(self._rs.disparity_transform(False))
+        if self.depth_hole_filling_mode >= 0:
+            self._depth_filters.append(
+                self._rs.hole_filling_filter(self.depth_hole_filling_mode)
+            )
+
+    def _filtered_depth_frame(self, depth_frame):
+        filtered = depth_frame
+        for processing_filter in self._depth_filters:
+            filtered = processing_filter.process(filtered)
+        return filtered.as_depth_frame()
+
+    @staticmethod
+    def _time_message(stamp_ns, template):
+        template.sec = int(stamp_ns // 1000000000)
+        template.nanosec = int(stamp_ns % 1000000000)
+        return template
 
     def _make_camera_info(self, profile) -> CameraInfo:
         stream = profile.get_stream(self._rs.stream.color)
@@ -323,6 +417,15 @@ class DepthCameraBridge(Node):
             color_frame = aligned.get_color_frame()
             if not depth_frame or not color_frame:
                 return
+            arrival_ros_ns = self.get_clock().now().nanoseconds
+            device_timestamp_ms = float(color_frame.get_timestamp())
+            stamp_ns = self._capture_clock.to_ros_ns(
+                device_timestamp_ms, arrival_ros_ns
+            )
+            self._capture_timestamp_domain = str(
+                color_frame.get_frame_timestamp_domain()
+            )
+            depth_frame = self._filtered_depth_frame(depth_frame)
             frame_processing_started = time.monotonic()
             color = np.asanyarray(color_frame.get_data())
             raw_depth = np.asanyarray(depth_frame.get_data())
@@ -350,13 +453,17 @@ class DepthCameraBridge(Node):
             # The viewer images retain the exact same capture timestamp but
             # are no longer synchronized downstream by independent DDS queues.
             publish_started = time.monotonic()
-            stamp = self.get_clock().now().to_msg()
+            stamp = self._time_message(stamp_ns, self.get_clock().now().to_msg())
             for message in (cloud_message, color_message, depth_message):
                 message.header.stamp = stamp
                 message.header.frame_id = self.frame_id
             self._pointcloud_publisher.publish(cloud_message)
             self._depth_publisher.publish(depth_message)
             self._depth_info_publisher.publish(self._camera_info(stamp))
+            self._last_capture_stamp_ns = stamp_ns
+            self._last_capture_latency_sec = max(
+                0.0, (arrival_ros_ns - stamp_ns) * 1.0e-9
+            )
             self._color_publisher.publish(color_message)
             self._color_info_publisher.publish(self._camera_info(stamp))
             self._last_cloud_point_count = int(points_camera.shape[0])
@@ -403,6 +510,7 @@ class DepthCameraBridge(Node):
             if not matching:
                 raise RuntimeError("the configured D435i disappeared from USB")
             matching[0].hardware_reset()
+            self._capture_clock.reset()
             time.sleep(self.hardware_reset_wait_sec)
             self._profile = self._start_pipeline()
             self._camera_info_template = self._make_camera_info(self._profile)
@@ -482,6 +590,14 @@ class DepthCameraBridge(Node):
             "atomic_pointcloud_topic": self.pointcloud_topic,
             "atomic_pointcloud_points": self._last_cloud_point_count,
             "pointcloud_pixel_stride": self.pointcloud_pixel_stride,
+            "capture_timestamp_domain": self._capture_timestamp_domain,
+            "capture_latency_sec": self._last_capture_latency_sec,
+            "capture_clock_reset_count": self._capture_clock.reset_count,
+            "depth_filtering": {
+                "spatial": self.depth_spatial_filter,
+                "temporal": self.depth_temporal_filter,
+                "hole_filling_mode": self.depth_hole_filling_mode,
+            },
         }
         message = String()
         message.data = json.dumps(
